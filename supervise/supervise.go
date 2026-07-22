@@ -24,7 +24,10 @@ package supervise
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"src.kyanite.computer/core/supervise/internal/ring"
@@ -46,20 +49,48 @@ type Supervisor struct {
 	defBackoff   Backoff
 	panicOnFault bool
 
-	specs []Spec // registered pre-Run
+	// mu guards specs and started only across the Add/Run setup handoff. It is
+	// never taken on the exit/restart hot path (that is single-owner loop
+	// state); it exists solely to make pre-Run Add and Run's startup
+	// race-free with respect to each other.
+	mu      sync.Mutex
+	specs   []Spec // registered pre-Run
+	started bool
+
+	// runStarted is closed once Run's loop is accepting commands, so live
+	// Add/Stop can wait for the mailbox to exist.
+	runStarted chan struct{}
 
 	// Runtime state, owned by the Run loop goroutine after Run starts.
 	ctx        context.Context
 	rootCancel context.CancelCauseFunc
 	done       chan struct{}
 	exitCh     chan exitMsg
+	cmdCh      chan command
 	timer      *time.Timer
 	children   map[childID]*child
 	order      []childID
+	nextID     childID
 	live       int
 	shutting   bool
 	failure    error
 }
+
+// command is a request delivered to the run loop's mailbox by Add/Stop.
+type command interface{ isCommand() }
+
+type addCommand struct {
+	spec  Spec
+	reply chan error
+}
+
+type stopCommand struct {
+	name  string
+	reply chan error
+}
+
+func (addCommand) isCommand()  {}
+func (stopCommand) isCommand() {}
 
 // Option configures a [Supervisor].
 type Option func(*Supervisor)
@@ -101,6 +132,7 @@ func New(name string, opts ...Option) *Supervisor {
 		strategy:    OneForOne,
 		defShutdown: DefaultShutdown,
 		defBackoff:  DefaultBackoff,
+		runStarted:  make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(s)
@@ -111,13 +143,76 @@ func New(name string, opts ...Option) *Supervisor {
 // Name returns the supervisor name.
 func (s *Supervisor) Name() string { return s.name }
 
-// Add registers a child specification. It must be called before [Run]. A Spec
-// with a nil Start is ignored.
-func (s *Supervisor) Add(spec Spec) {
+// Add registers a child specification. Called before [Run] it appends to the
+// initial set (do this from a single goroutine during setup). Called after Run
+// has started it registers the child live through the command mailbox and
+// spawns it immediately. A Spec with a nil Start is rejected.
+func (s *Supervisor) Add(spec Spec) error {
 	if spec.Start == nil {
-		return
+		return errors.New("supervise: Add with nil Spec.Start")
 	}
-	s.specs = append(s.specs, spec)
+	s.mu.Lock()
+	if !s.started {
+		s.specs = append(s.specs, spec)
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+	// Live: route through the mailbox so the loop owns the mutation.
+	reply := make(chan error, 1)
+	return s.deliver(addCommand{spec: spec, reply: reply}, reply)
+}
+
+// AddSupervisor registers a child supervisor as a supervised subtree with
+// restart policy r. A child supervisor's failure (for example *IntensityError)
+// is an error return from its Run, so it escalates through the parent's normal
+// restart handling — Erlang-style tree escalation.
+func (s *Supervisor) AddSupervisor(child *Supervisor, r Restart) error {
+	return s.Add(Spec{Name: child.name, Start: child.Run, Restart: r})
+}
+
+// Stop cancels the named child and prevents it from restarting. It waits for
+// the loop to accept the request (not for the child to exit). It returns an
+// error if no active child has that name, or [ErrShutdown] if the supervisor is
+// stopping. Stop is only meaningful after [Run] has started.
+func (s *Supervisor) Stop(name string) error {
+	reply := make(chan error, 1)
+	return s.deliver(stopCommand{name: name, reply: reply}, reply)
+}
+
+// deliver sends a command to the run loop and waits for its reply, aborting if
+// the supervisor stops first.
+func (s *Supervisor) deliver(c command, reply chan error) error {
+	select {
+	case <-s.runStarted:
+	case <-s.done:
+		return ErrShutdown
+	}
+	select {
+	case s.cmdCh <- c:
+	case <-s.done:
+		return ErrShutdown
+	}
+	select {
+	case err := <-reply:
+		return err
+	case <-s.done:
+		return ErrShutdown
+	}
+}
+
+// createChild builds and registers a child record for spec, assigning a unique
+// id. It does not spawn the child. Called only from the run loop (or Run's
+// setup before the loop starts).
+func (s *Supervisor) createChild(spec Spec) *child {
+	s.nextID++
+	c := &child{id: s.nextID, spec: spec}
+	if s.intensity.enabled() {
+		c.restarts = ring.New[time.Time](s.intensity.MaxRestarts)
+	}
+	s.children[c.id] = c
+	s.order = append(s.order, c.id)
+	return c
 }
 
 // Run starts every registered child in its own guarded goroutine and blocks
@@ -135,31 +230,33 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	s.done = make(chan struct{})
 	defer close(s.done)
 
+	// All reads of s.specs and the initial spawn happen under mu so they cannot
+	// race a concurrent Add; started is then flipped so subsequent Adds route
+	// through the mailbox.
+	s.mu.Lock()
 	bufsz := 2 * len(s.specs)
 	if bufsz < 1 {
 		bufsz = 1
 	}
 	s.exitCh = make(chan exitMsg, bufsz)
+	s.cmdCh = make(chan command)
 	s.children = make(map[childID]*child, len(s.specs))
 	s.order = make([]childID, 0, len(s.specs))
-
 	for i := range s.specs {
-		c := &child{
-			id:   childID(i + 1),
-			spec: s.specs[i],
-		}
-		if s.intensity.enabled() {
-			c.restarts = ring.New[time.Time](s.intensity.MaxRestarts)
-		}
-		s.children[c.id] = c
-		s.order = append(s.order, c.id)
+		c := s.createChild(s.specs[i])
 		s.spawn(c)
 		s.live++
 	}
+	s.started = true
+	s.mu.Unlock()
 
 	s.timer = time.NewTimer(time.Hour)
 	s.timer.Stop()
 	defer s.timer.Stop()
+
+	// Signal that live Add/Stop may now use the mailbox. Everything after this
+	// runs in the single-owner loop.
+	close(s.runStarted)
 
 	ctxDone := s.ctx.Done()
 	for s.live > 0 {
@@ -167,6 +264,8 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		select {
 		case m := <-s.exitCh:
 			s.handleExit(m)
+		case c := <-s.cmdCh:
+			s.handleCommand(c)
 		case <-s.timer.C:
 			s.handleTimer()
 		case <-ctxDone:
@@ -234,6 +333,54 @@ func (s *Supervisor) handleExit(m exitMsg) {
 	c.dueAt = s.now().Add(c.backoff)
 	c.state = stBackoff
 	s.emit(Event{Kind: EventRestarting, Tree: s.path, Child: c.spec.Name, At: s.now(), Extra: c.backoff})
+}
+
+// handleCommand processes a mailbox command (live Add / Stop) in the loop.
+func (s *Supervisor) handleCommand(c command) {
+	switch cmd := c.(type) {
+	case addCommand:
+		if s.shutting {
+			cmd.reply <- ErrShutdown
+			return
+		}
+		ch := s.createChild(cmd.spec)
+		s.spawn(ch)
+		s.live++
+		cmd.reply <- nil
+	case stopCommand:
+		ch := s.findActive(cmd.name)
+		if ch == nil {
+			cmd.reply <- fmt.Errorf("supervise: no active child named %q", cmd.name)
+			return
+		}
+		s.stopChild(ch)
+		cmd.reply <- nil
+	}
+}
+
+// findActive returns the first active child with the given name, or nil.
+func (s *Supervisor) findActive(name string) *child {
+	for _, id := range s.order {
+		c := s.children[id]
+		if c.spec.Name == name && c.active() {
+			return c
+		}
+	}
+	return nil
+}
+
+// stopChild cancels a child and marks it terminal (no restart).
+func (s *Supervisor) stopChild(c *child) {
+	c.stopRequested = true
+	switch c.state {
+	case stRunning:
+		c.cancel(ErrStopped)
+		c.state = stStopping
+		c.graceUntil = s.now().Add(s.graceFor(c))
+	case stBackoff:
+		c.state = stDone
+		s.live--
+	}
 }
 
 // shouldRestart applies the child's restart policy to an exit reason.

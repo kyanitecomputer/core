@@ -230,6 +230,95 @@ func TestSynctestCompat(t *testing.T) {
 	})
 }
 
+func TestStopPreventsRestart(t *testing.T) {
+	var victimRuns, keepRuns atomic.Int64
+	s := New("t", quietOpts(fastBackoff())...)
+	s.Add(Spec{Name: "keep", Restart: Permanent, Start: func(ctx context.Context) error {
+		keepRuns.Add(1)
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+	s.Add(Spec{Name: "victim", Restart: Permanent, Start: func(ctx context.Context) error {
+		victimRuns.Add(1)
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := runAsync(s, ctx)
+	waitFor(t, func() bool { return victimRuns.Load() >= 1 && keepRuns.Load() >= 1 })
+
+	if err := s.Stop("victim"); err != nil {
+		t.Fatalf("Stop(victim): %v", err)
+	}
+	time.Sleep(20 * time.Millisecond) // give any (erroneous) restart a chance
+	if got := victimRuns.Load(); got != 1 {
+		t.Fatalf("victim ran %d times after Stop, want 1 (no restart)", got)
+	}
+	if err := s.Stop("nonexistent"); err == nil {
+		t.Fatal("Stop of unknown child should error")
+	}
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want context.Canceled", err)
+	}
+}
+
+func TestLiveAdd(t *testing.T) {
+	var addedRuns atomic.Int64
+	s := New("t", quietOpts()...)
+	s.Add(Spec{Name: "anchor", Restart: Permanent, Start: func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := runAsync(s, ctx)
+
+	// Add blocks until Run has started, then registers and spawns live.
+	if err := s.Add(Spec{Name: "late", Restart: Permanent, Start: func(ctx context.Context) error {
+		addedRuns.Add(1)
+		<-ctx.Done()
+		return ctx.Err()
+	}}); err != nil {
+		t.Fatalf("live Add: %v", err)
+	}
+	waitFor(t, func() bool { return addedRuns.Load() >= 1 })
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want context.Canceled", err)
+	}
+}
+
+func TestTreeNesting(t *testing.T) {
+	var leafRuns atomic.Int64
+	sub := New("sub", quietOpts()...)
+	sub.Add(Spec{Name: "leaf", Restart: Permanent, Start: func(ctx context.Context) error {
+		leafRuns.Add(1)
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+
+	root := New("root", quietOpts()...)
+	if err := root.AddSupervisor(sub, Permanent); err != nil {
+		t.Fatalf("AddSupervisor: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := runAsync(root, ctx)
+	waitFor(t, func() bool { return leafRuns.Load() >= 1 })
+	cancel()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("root Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("root Run did not cascade-cancel the subtree")
+	}
+}
+
 func TestNoChildrenReturnsNil(t *testing.T) {
 	s := New("empty", quietOpts()...)
 	if err := s.Run(context.Background()); err != nil {

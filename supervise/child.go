@@ -87,6 +87,8 @@ type child struct {
 
 	dueAt      time.Time // respawn deadline when stBackoff (0 otherwise)
 	graceUntil time.Time // abandonment deadline when stStopping (0 otherwise)
+
+	stopRequested bool // Stop was called: do not restart on exit
 }
 
 // active reports whether the supervisor is still waiting on this child (either
