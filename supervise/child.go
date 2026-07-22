@@ -47,6 +47,9 @@ const (
 	stBackoff
 	// stStopping: cancelled, within its grace period, awaiting exit.
 	stStopping
+	// stQuiesced: exited as part of an in-progress group restart (OneForAll /
+	// RestForOne), awaiting the rest of the affected set before respawning.
+	stQuiesced
 	// stAbandoned: grace elapsed while still running; no longer waited on.
 	stAbandoned
 	// stDone: terminal, will not restart (Temporary, or clean Transient).
@@ -63,6 +66,8 @@ func (c childState) String() string {
 		return "backoff"
 	case stStopping:
 		return "stopping"
+	case stQuiesced:
+		return "quiesced"
 	case stAbandoned:
 		return "abandoned"
 	case stDone:
@@ -88,11 +93,18 @@ type child struct {
 	dueAt      time.Time // respawn deadline when stBackoff (0 otherwise)
 	graceUntil time.Time // abandonment deadline when stStopping (0 otherwise)
 
-	stopRequested bool // Stop was called: do not restart on exit
+	stopRequested  bool // Stop was called: do not restart on exit
+	restartPending bool // part of an in-progress group restart
 }
 
 // active reports whether the supervisor is still waiting on this child (either
-// a guard is running or a respawn is pending).
+// a guard is running, a respawn is pending, or it is quiescing for a group
+// restart).
 func (c *child) active() bool {
-	return c.state == stRunning || c.state == stBackoff || c.state == stStopping
+	switch c.state {
+	case stRunning, stBackoff, stStopping, stQuiesced:
+		return true
+	default:
+		return false
+	}
 }

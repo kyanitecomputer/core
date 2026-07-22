@@ -296,6 +296,13 @@ func (s *Supervisor) handleExit(m exitMsg) {
 	s.emit(Event{Kind: EventExited, Tree: s.path, Child: c.spec.Name, At: s.now(), Err: m.err})
 
 	if c.state == stStopping {
+		if c.restartPending {
+			// Cancelled as part of a group restart and now quiesced; wait for
+			// the rest of the affected set, then respawn together.
+			c.state = stQuiesced
+			s.maybeGroupRespawn()
+			return
+		}
 		// Exited within grace during shutdown/stop: terminal, no restart.
 		c.state = stDone
 		s.live--
@@ -328,11 +335,98 @@ func (s *Supervisor) handleExit(m exitMsg) {
 		c.restarts.Push(s.now())
 	}
 
-	// Schedule respawn after decorrelated-jitter backoff.
-	c.backoff = s.backoffFor(c).next(c.backoff)
-	c.dueAt = s.now().Add(c.backoff)
-	c.state = stBackoff
-	s.emit(Event{Kind: EventRestarting, Tree: s.path, Child: c.spec.Name, At: s.now(), Extra: c.backoff})
+	s.beginRestart(c, m.err)
+}
+
+// beginRestart starts a (possibly group) restart triggered by child c failing
+// with err. For OneForOne the affected set is just c; for OneForAll it is all
+// restartable children; for RestForOne it is c and every child declared after
+// it. Affected siblings that are running are cancelled with a SiblingFailure
+// cause and, once the whole set has quiesced, the set is respawned in
+// declaration order after backoff.
+func (s *Supervisor) beginRestart(c *child, err error) {
+	affected := s.affectedIDs(c)
+	for _, id := range affected {
+		s.children[id].restartPending = true
+	}
+
+	// The triggering child has already exited.
+	c.state = stQuiesced
+
+	now := s.now()
+	for _, id := range affected {
+		a := s.children[id]
+		if a.id == c.id {
+			continue
+		}
+		switch a.state {
+		case stRunning:
+			a.cancel(SiblingFailure{Sibling: c.spec.Name, Err: err})
+			a.state = stStopping
+			a.graceUntil = now.Add(s.graceFor(a))
+		case stBackoff:
+			// Not running; ready to respawn with the group.
+			a.state = stQuiesced
+		}
+	}
+	s.maybeGroupRespawn()
+}
+
+// affectedIDs returns the ordered ids of children a restart of c affects, per
+// the supervisor strategy. Only restartable children are included: Temporary
+// and already-terminal children are left untouched.
+func (s *Supervisor) affectedIDs(c *child) []childID {
+	restartable := func(x *child) bool {
+		return x.spec.Restart != Temporary && x.state != stDone && x.state != stAbandoned
+	}
+	switch s.strategy {
+	case OneForAll:
+		ids := make([]childID, 0, len(s.order))
+		for _, id := range s.order {
+			if restartable(s.children[id]) {
+				ids = append(ids, id)
+			}
+		}
+		return ids
+	case RestForOne:
+		ids := make([]childID, 0, len(s.order))
+		after := false
+		for _, id := range s.order {
+			if id == c.id {
+				after = true
+			}
+			if after && restartable(s.children[id]) {
+				ids = append(ids, id)
+			}
+		}
+		return ids
+	default: // OneForOne
+		return []childID{c.id}
+	}
+}
+
+// maybeGroupRespawn respawns the pending affected set once every one of its
+// members has quiesced (none still running or stopping), in declaration order
+// after per-child backoff.
+func (s *Supervisor) maybeGroupRespawn() {
+	for _, id := range s.order {
+		c := s.children[id]
+		if c.restartPending && (c.state == stRunning || c.state == stStopping) {
+			return // still quiescing
+		}
+	}
+	now := s.now()
+	for _, id := range s.order {
+		c := s.children[id]
+		if !c.restartPending {
+			continue
+		}
+		c.restartPending = false
+		c.backoff = s.backoffFor(c).next(c.backoff)
+		c.dueAt = now.Add(c.backoff)
+		c.state = stBackoff
+		s.emit(Event{Kind: EventRestarting, Tree: s.path, Child: c.spec.Name, At: now, Extra: c.backoff})
+	}
 }
 
 // handleCommand processes a mailbox command (live Add / Stop) in the loop.
@@ -377,7 +471,7 @@ func (s *Supervisor) stopChild(c *child) {
 		c.cancel(ErrStopped)
 		c.state = stStopping
 		c.graceUntil = s.now().Add(s.graceFor(c))
-	case stBackoff:
+	case stBackoff, stQuiesced:
 		c.state = stDone
 		s.live--
 	}
@@ -408,17 +502,26 @@ func (s *Supervisor) handleTimer() {
 			}
 		case stStopping:
 			if !c.graceUntil.After(now) {
-				c.state = stAbandoned
-				s.live--
 				elapsed := s.graceFor(c)
 				s.emit(Event{
 					Kind: EventAbandoned, Tree: s.path, Child: c.spec.Name,
 					At: now, Extra: elapsed,
 					Err: &AbandonedError{Child: c.spec.Name, Elapsed: elapsed},
 				})
-				if c.spec.Critical && s.failure == nil {
-					s.failure = &AbandonedError{Child: c.spec.Name, Elapsed: elapsed}
-					s.rootCancel(s.failure)
+				if c.restartPending {
+					// Uncooperative during a group restart: respawn a fresh
+					// incarnation and stop waiting on the rogue one (which is
+					// tracked and late-reaped). live is unchanged — the child
+					// remains active via its new incarnation.
+					c.state = stQuiesced
+					s.maybeGroupRespawn()
+				} else {
+					c.state = stAbandoned
+					s.live--
+					if c.spec.Critical && s.failure == nil {
+						s.failure = &AbandonedError{Child: c.spec.Name, Elapsed: elapsed}
+						s.rootCancel(s.failure)
+					}
 				}
 			}
 		}
@@ -435,13 +538,14 @@ func (s *Supervisor) beginShutdown() {
 	now := s.now()
 	for _, id := range s.order {
 		c := s.children[id]
+		c.restartPending = false // no group restarts survive shutdown
 		switch c.state {
 		case stRunning:
 			c.cancel(ErrShutdown)
 			c.state = stStopping
 			c.graceUntil = now.Add(s.graceFor(c))
-		case stBackoff:
-			// No goroutine running; the pending respawn is cancelled.
+		case stBackoff, stQuiesced:
+			// No goroutine running; the pending (re)spawn is cancelled.
 			c.state = stDone
 			s.live--
 		}

@@ -319,6 +319,75 @@ func TestTreeNesting(t *testing.T) {
 	}
 }
 
+func TestOneForAllRestartsAll(t *testing.T) {
+	var aRuns, bRuns, cRuns atomic.Int64
+	s := New("t", quietOpts(fastBackoff(), WithStrategy(OneForAll))...)
+	s.Add(Spec{Name: "a", Restart: Permanent, Start: func(ctx context.Context) error {
+		if aRuns.Add(1) == 1 {
+			return errors.New("a boom") // fail once; triggers group restart
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+	s.Add(Spec{Name: "b", Restart: Permanent, Start: func(ctx context.Context) error {
+		bRuns.Add(1)
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+	s.Add(Spec{Name: "c", Restart: Permanent, Start: func(ctx context.Context) error {
+		cRuns.Add(1)
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := runAsync(s, ctx)
+	// All three must restart (reach a 2nd run) because a's single failure
+	// takes the whole set down under OneForAll.
+	waitFor(t, func() bool {
+		return aRuns.Load() >= 2 && bRuns.Load() >= 2 && cRuns.Load() >= 2
+	})
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want context.Canceled", err)
+	}
+}
+
+func TestRestForOneRestartsSuffix(t *testing.T) {
+	var aRuns, bRuns, cRuns atomic.Int64
+	s := New("t", quietOpts(fastBackoff(), WithStrategy(RestForOne))...)
+	s.Add(Spec{Name: "a", Restart: Permanent, Start: func(ctx context.Context) error {
+		aRuns.Add(1)
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+	s.Add(Spec{Name: "b", Restart: Permanent, Start: func(ctx context.Context) error {
+		if bRuns.Add(1) == 1 {
+			return errors.New("b boom") // fail once
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+	s.Add(Spec{Name: "c", Restart: Permanent, Start: func(ctx context.Context) error {
+		cRuns.Add(1)
+		<-ctx.Done()
+		return ctx.Err()
+	}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := runAsync(s, ctx)
+	// b and c (declared at/after b) restart; a (before b) is untouched.
+	waitFor(t, func() bool { return bRuns.Load() >= 2 && cRuns.Load() >= 2 })
+	time.Sleep(20 * time.Millisecond)
+	if got := aRuns.Load(); got != 1 {
+		t.Fatalf("a (declared before the failure) ran %d times, want 1", got)
+	}
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want context.Canceled", err)
+	}
+}
+
 func TestNoChildrenReturnsNil(t *testing.T) {
 	s := New("empty", quietOpts()...)
 	if err := s.Run(context.Background()); err != nil {
