@@ -25,6 +25,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"src.kyanite.computer/core/telemetry/keys"
 )
 
 // RingSize is the maximum number of log records kept in the in-process ring
@@ -65,13 +67,20 @@ var ring struct {
 }
 
 // Init installs the default slog handler. It must be called once at startup
-// before any logging. Records are fanned out to the CR-LF console (os.Stdout)
-// and the ring buffer. serviceName is reserved for a future OTLP scope.
+// before any logging. Records are stamped with trace correlation (trace_id/
+// span_id from the active span context, WARN+ escalated to span events) by a
+// [traceHandler] middleware, then fanned out to the CR-LF console (os.Stdout)
+// and the in-process ring buffer. serviceName is attached as service.name so it
+// appears on every record.
 func Init(serviceName string) {
-	_ = serviceName
 	console := newConsoleHandler(os.Stdout, slog.LevelInfo)
 	ring := &ringHandler{level: slog.LevelInfo}
-	slog.SetDefault(slog.New(multiHandler{handlers: []slog.Handler{console, ring}}))
+	base := multiHandler{handlers: []slog.Handler{console, ring}}
+	h := slog.Handler(traceHandler{inner: base})
+	if serviceName != "" {
+		h = h.WithAttrs([]slog.Attr{slog.String(keys.ServiceName, serviceName)})
+	}
+	slog.SetDefault(slog.New(h))
 }
 
 // Shutdown is a no-op retained for API compatibility and future exporters.
