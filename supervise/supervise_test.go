@@ -395,6 +395,49 @@ func TestNoChildrenReturnsNil(t *testing.T) {
 	}
 }
 
+func TestEventStream(t *testing.T) {
+	s := New("t", quietOpts()...)
+	s.Add(Spec{Name: "once", Restart: Temporary, Start: func(context.Context) error {
+		return nil // clean one-shot: started -> exited -> stopped
+	}})
+
+	var mu sync.Mutex
+	var kinds []EventKind
+	consumed := make(chan struct{})
+	go func() {
+		for e := range s.Events() {
+			mu.Lock()
+			kinds = append(kinds, e.Kind)
+			mu.Unlock()
+		}
+		close(consumed)
+	}()
+
+	// Run returns once the temporary child completes (no active children left).
+	if err := s.Run(context.Background()); err != nil {
+		t.Fatalf("Run returned %v, want nil", err)
+	}
+	<-consumed // Events range ends when the stream closes at Run return
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !hasKind(kinds, EventStarted) || !hasKind(kinds, EventStopped) {
+		t.Fatalf("event stream missing started/stopped; got %v", kinds)
+	}
+	if n := s.DroppedEvents(); n != 0 {
+		t.Fatalf("dropped %d events with a 64-deep buffer and 3 events", n)
+	}
+}
+
+func hasKind(ks []EventKind, want EventKind) bool {
+	for _, k := range ks {
+		if k == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestNoLeaks(t *testing.T) {
 	var runs atomic.Int64
 	s := New("t", quietOpts(fastBackoff())...)

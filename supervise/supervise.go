@@ -28,10 +28,15 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"src.kyanite.computer/core/supervise/internal/ring"
 )
+
+// DefaultEventBuffer is the lifecycle-event stream buffer used when
+// [WithEventBuffer] is not supplied.
+const DefaultEventBuffer = 64
 
 // DefaultShutdown is the grace period between cancelling a child and declaring
 // it abandoned, when a Spec does not override it.
@@ -48,6 +53,7 @@ type Supervisor struct {
 	defShutdown  time.Duration
 	defBackoff   Backoff
 	panicOnFault bool
+	eventBuf     int
 
 	// mu guards specs and started only across the Add/Run setup handoff. It is
 	// never taken on the exit/restart hot path (that is single-owner loop
@@ -60,6 +66,12 @@ type Supervisor struct {
 	// runStarted is closed once Run's loop is accepting commands, so live
 	// Add/Stop can wait for the mailbox to exist.
 	runStarted chan struct{}
+
+	// events is the bounded, lossy lifecycle-event stream consumed via Events.
+	// The loop is the sole producer and never blocks on it: a full buffer drops
+	// the event and increments droppedEvents.
+	events        chan Event
+	droppedEvents atomic.Uint64
 
 	// Runtime state, owned by the Run loop goroutine after Run starts.
 	ctx        context.Context
@@ -123,6 +135,12 @@ func WithPanicOnFault() Option { return func(s *Supervisor) { s.panicOnFault = t
 // slog.Default().
 func WithLogger(l *slog.Logger) Option { return func(s *Supervisor) { s.log = l } }
 
+// WithEventBuffer sets the capacity of the [Supervisor.Events] stream buffer.
+// Defaults to [DefaultEventBuffer]. A slow or absent consumer causes overflow
+// events to be dropped (counted by [Supervisor.DroppedEvents]); the supervisor
+// loop never blocks on event delivery.
+func WithEventBuffer(n int) Option { return func(s *Supervisor) { s.eventBuf = n } }
+
 // New returns a Supervisor named name.
 func New(name string, opts ...Option) *Supervisor {
 	s := &Supervisor{
@@ -132,11 +150,16 @@ func New(name string, opts ...Option) *Supervisor {
 		strategy:    OneForOne,
 		defShutdown: DefaultShutdown,
 		defBackoff:  DefaultBackoff,
+		eventBuf:    DefaultEventBuffer,
 		runStarted:  make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(s)
 	}
+	if s.eventBuf < 1 {
+		s.eventBuf = 1
+	}
+	s.events = make(chan Event, s.eventBuf)
 	return s
 }
 
@@ -229,6 +252,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	defer s.rootCancel(nil)
 	s.done = make(chan struct{})
 	defer close(s.done)
+	// Close the event stream after the loop (all emit calls are loop-owned, so
+	// no send can race this) to end any active Events range.
+	defer close(s.events)
 
 	// All reads of s.specs and the initial spawn happen under mu so they cannot
 	// race a concurrent Add; started is then flipped so subsequent Adds route

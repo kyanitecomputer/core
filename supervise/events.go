@@ -4,6 +4,7 @@ package supervise
 
 import (
 	"context"
+	"iter"
 	"log/slog"
 	"time"
 )
@@ -67,9 +68,38 @@ type Event struct {
 	Extra time.Duration // elapsed/backoff, event-specific
 }
 
-// log writes the event through the supervisor's logger at a severity matching
-// its kind.
+// Events returns a pull-based stream of supervision lifecycle events, suitable
+// for a management/telemetry consumer. It ranges until the supervisor stops
+// (its Run returns) or the caller breaks. The stream is bounded and lossy: if
+// the consumer falls behind, events are dropped rather than blocking the
+// supervisor loop, and the drop count is available via [Supervisor.DroppedEvents].
+//
+// A single consumer is supported; events are delivered to whichever range is
+// active. Call it from a dedicated goroutine, typically after Run has started.
+func (s *Supervisor) Events() iter.Seq[Event] {
+	return func(yield func(Event) bool) {
+		for e := range s.events {
+			if !yield(e) {
+				return
+			}
+		}
+	}
+}
+
+// DroppedEvents returns the number of lifecycle events dropped because the
+// [Supervisor.Events] buffer was full.
+func (s *Supervisor) DroppedEvents() uint64 { return s.droppedEvents.Load() }
+
+// emit publishes an event to the bounded stream (non-blocking; drops with a
+// counter on overflow) and logs it through the supervisor's logger at a
+// severity matching its kind.
 func (s *Supervisor) emit(e Event) {
+	select {
+	case s.events <- e:
+	default:
+		s.droppedEvents.Add(1)
+	}
+
 	if s.log == nil {
 		return
 	}
