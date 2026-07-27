@@ -40,6 +40,15 @@ func (c *Config[S, T, E]) isAncestorOrSelf(cur, target int) bool {
 	return c.ancestors[cur*c.wordsPerState+target/64]&(1<<(uint(target)%64)) != 0
 }
 
+// isDeferred reports whether trigger t is deferred in state s (directly or by
+// inheritance from an ancestor).
+func (c *Config[S, T, E]) isDeferred(s, t int) bool {
+	if !c.hasDefer || t >= c.numTriggers {
+		return false
+	}
+	return c.deferMask[s*c.deferWords+t/64]&(1<<(uint(t)%64)) != 0
+}
+
 // hierarchy holds the compiled hierarchy tables. All fields are plain integers
 // so the computation is non-generic.
 type hierarchy struct {
@@ -47,6 +56,7 @@ type hierarchy struct {
 	depth         []int
 	initialSub    []int
 	ancestors     []uint64
+	hasChildren   []bool
 	wordsPerState int
 	maxDepth      int
 }
@@ -109,6 +119,7 @@ func computeHierarchy(numStates int, parentOf, initialOf []int, directlyEntered 
 			hasChildren[parentOf[s]] = true
 		}
 	}
+	h.hasChildren = hasChildren
 
 	// An initial substate must be a direct child of the state declaring it.
 	for s := 0; s < numStates; s++ {

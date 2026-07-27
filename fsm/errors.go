@@ -49,6 +49,18 @@ func (e *QueueOverflowError[T]) Error() string {
 		e.Capacity, uint8(e.Trigger))
 }
 
+// DeferOverflowError reports that a deferred trigger could not be stashed
+// because the deferral ring was full.
+type DeferOverflowError[T ~uint8] struct {
+	Trigger  T
+	Capacity int
+}
+
+func (e *DeferOverflowError[T]) Error() string {
+	return fmt.Sprintf("fsm: deferral ring full (cap %d), dropped trigger %d",
+		e.Capacity, uint8(e.Trigger))
+}
+
 // ActionError wraps an error returned by an entry, exit, transition, or
 // internal action, tagged with the transition it occurred on.
 type ActionError[S ~uint8, T ~uint8] struct {

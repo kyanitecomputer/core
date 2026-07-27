@@ -44,7 +44,20 @@ import (
 	"context"
 	"iter"
 	"sync/atomic"
+	"time"
 )
+
+// Clock is the time source used for state timeouts. It is deliberately distinct
+// from any clock in supervise: the two packages compose but do not depend on
+// each other. The default is real wall-clock time; tests inject a fake clock
+// (for example via testing/synctest) through [WithClock].
+type Clock interface {
+	Now() time.Time
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
 
 // Kind classifies a transition for the Transition value passed to actions.
 type Kind uint8
@@ -163,6 +176,21 @@ type Config[S ~uint8, T ~uint8, E any] struct {
 	ancestors     []uint64
 	wordsPerState int
 	maxDepth      int
+
+	// Deferral: deferMask is a per-state bitset (deferWords uint64 words each)
+	// of triggers deferred in that state or an ancestor. hasDefer is false when
+	// no state defers anything, so instances skip allocating a deferred ring.
+	clock      Clock
+	deferCap   int
+	hasDefer   bool
+	deferMask  []uint64
+	deferWords int
+
+	// State timeouts: timeoutDur[s] > 0 arms a deadline on entering state s that
+	// fires timeoutTrig[s] once elapsed. The library owns no timer; the owner
+	// polls NextDeadline and calls Tick.
+	timeoutDur  []time.Duration
+	timeoutTrig []T
 }
 
 // Instance returns a fresh machine instance positioned at the configured
@@ -174,12 +202,17 @@ func (c *Config[S, T, E]) Instance() *Instance[S, T, E] {
 	for c.initialSub[st] >= 0 {
 		st = c.initialSub[st]
 	}
-	return &Instance[S, T, E]{
+	i := &Instance[S, T, E]{
 		cfg:     c,
 		state:   S(st),
 		queue:   make([]queued[T, E], c.queueCap),
 		pathBuf: make([]S, c.maxDepth+1),
 	}
+	if c.hasDefer {
+		i.deferred = make([]queued[T, E], c.deferCap)
+	}
+	i.armTimeout()
+	return i
 }
 
 // Counters is a snapshot of an instance's activity counters.
@@ -189,6 +222,9 @@ type Counters struct {
 	Rejected      uint64
 	Unhandled     uint64
 	QueueOverflow uint64
+	Deferred      uint64
+	DeferOverflow uint64
+	Timeouts      uint64
 }
 
 type counters struct {
@@ -197,6 +233,9 @@ type counters struct {
 	rejected      atomic.Uint64
 	unhandled     atomic.Uint64
 	queueOverflow atomic.Uint64
+	deferred      atomic.Uint64
+	deferOverflow atomic.Uint64
+	timeouts      atomic.Uint64
 }
 
 type queued[T ~uint8, E any] struct {
@@ -214,6 +253,18 @@ type Instance[S ~uint8, T ~uint8, E any] struct {
 	queue  []queued[T, E]
 	qhead  int
 	qlen   int
+
+	// deferred is the fixed-capacity ring of deferred triggers, re-offered in
+	// FIFO order after any transition that changes the leaf state. It is nil
+	// when the machine defers nothing.
+	deferred []queued[T, E]
+	dhead    int
+	dlen     int
+
+	// Timeout state for the current leaf, recomputed on each state change.
+	deadline    time.Time
+	hasDeadline bool
+	timeoutTrig T
 
 	// pathBuf is a scratch buffer for the enter-down walk, sized to the tree
 	// height at Instance creation so the fire path allocates nothing.
@@ -233,6 +284,9 @@ func (i *Instance[S, T, E]) Stats() Counters {
 		Rejected:      i.c.rejected.Load(),
 		Unhandled:     i.c.unhandled.Load(),
 		QueueOverflow: i.c.queueOverflow.Load(),
+		Deferred:      i.c.deferred.Load(),
+		DeferOverflow: i.c.deferOverflow.Load(),
+		Timeouts:      i.c.timeouts.Load(),
 	}
 }
 
@@ -258,20 +312,56 @@ func (i *Instance[S, T, E]) Fire(ctx context.Context, t T, ev E) error {
 	}
 
 	i.firing = true
-	err := i.fireOne(ctx, t, ev)
-	for i.qlen > 0 {
-		q := i.queue[i.qhead]
-		i.qhead = (i.qhead + 1) % len(i.queue)
-		i.qlen--
-		if e := i.fireOne(ctx, q.t, q.ev); e != nil && err == nil {
-			err = e
-		}
+	prev := i.state
+	err := i.fireOne(ctx, t, ev, false)
+	if i.state != prev {
+		i.reofferDeferred()
+	}
+	if e := i.drain(ctx); e != nil && err == nil {
+		err = e
 	}
 	i.firing = false
 	return err
 }
 
-func (i *Instance[S, T, E]) fireOne(ctx context.Context, t T, ev E) error {
+// drain processes the run-to-completion queue until empty, re-offering deferred
+// triggers after any transition that changes the leaf state. It returns the
+// first error encountered.
+func (i *Instance[S, T, E]) drain(ctx context.Context) error {
+	var err error
+	for i.qlen > 0 {
+		q := i.queue[i.qhead]
+		i.qhead = (i.qhead + 1) % len(i.queue)
+		i.qlen--
+		prev := i.state
+		if e := i.fireOne(ctx, q.t, q.ev, false); e != nil && err == nil {
+			err = e
+		}
+		if i.state != prev {
+			i.reofferDeferred()
+		}
+	}
+	return err
+}
+
+// reofferDeferred moves deferred triggers into the run-to-completion queue in
+// FIFO order so drain reprocesses them in the new state. If the queue fills,
+// the remainder stay deferred and are retried on the next state change.
+func (i *Instance[S, T, E]) reofferDeferred() {
+	n := i.dlen
+	for k := 0; k < n; k++ {
+		if i.qlen >= len(i.queue) {
+			return
+		}
+		d := i.deferred[i.dhead]
+		i.dhead = (i.dhead + 1) % len(i.deferred)
+		i.dlen--
+		i.queue[(i.qhead+i.qlen)%len(i.queue)] = d
+		i.qlen++
+	}
+}
+
+func (i *Instance[S, T, E]) fireOne(ctx context.Context, t T, ev E, timeout bool) error {
 	i.c.fires.Add(1)
 	if int(t) >= i.cfg.numTriggers {
 		i.c.unhandled.Add(1)
@@ -296,12 +386,16 @@ func (i *Instance[S, T, E]) fireOne(ctx context.Context, t T, ev E) error {
 				case ckIgnore:
 					return nil
 				case ckInternal:
-					tr := Transition[S, T]{Source: i.state, Destination: i.state, Trigger: t, Kind: Internal}
+					kind := Internal
+					if timeout {
+						kind = Timeout
+					}
+					tr := Transition[S, T]{Source: i.state, Destination: i.state, Trigger: t, Kind: kind}
 					return i.runAction(ctx, cand.action, tr, ev)
 				case ckReentry:
-					return i.doTransition(ctx, h, h, t, ev, true, cand.action)
+					return i.doTransition(ctx, h, h, t, ev, true, timeout, cand.action)
 				default: // ckExternal
-					return i.doTransition(ctx, h, int(cand.dst), t, ev, false, cand.action)
+					return i.doTransition(ctx, h, int(cand.dst), t, ev, false, timeout, cand.action)
 				}
 			}
 		}
@@ -311,6 +405,20 @@ func (i *Instance[S, T, E]) fireOne(ctx context.Context, t T, ev E) error {
 		}
 		h = p
 	}
+
+	// Not consumed. If the trigger is deferred in the current state (or an
+	// ancestor), stash it to be re-offered after the next state change.
+	if i.cfg.isDeferred(int(i.state), int(t)) {
+		if i.dlen >= len(i.deferred) {
+			i.c.deferOverflow.Add(1)
+			return &DeferOverflowError[T]{Trigger: t, Capacity: len(i.deferred)}
+		}
+		i.deferred[(i.dhead+i.dlen)%len(i.deferred)] = queued[T, E]{t: t, ev: ev}
+		i.dlen++
+		i.c.deferred.Add(1)
+		return nil
+	}
+
 	if !sawCandidate {
 		i.c.unhandled.Add(1)
 		return &UnhandledError[S, T]{State: i.state, Trigger: t}
@@ -325,12 +433,15 @@ func (i *Instance[S, T, E]) fireOne(ctx context.Context, t T, ev E) error {
 // then follows initial transitions to a resting leaf. For an external
 // transition the boundary is the least common ancestor of src and dst; for a
 // reentry it is the parent of src, so src itself is exited and re-entered.
-func (i *Instance[S, T, E]) doTransition(ctx context.Context, src, dst int, t T, ev E, reentry bool, action Action[S, T, E]) error {
+func (i *Instance[S, T, E]) doTransition(ctx context.Context, src, dst int, t T, ev E, reentry, timeout bool, action Action[S, T, E]) error {
 	kind := External
 	boundary := i.cfg.lcaOf(src, dst)
 	if reentry {
 		kind = Reentry
 		boundary = i.cfg.parent[src]
+	}
+	if timeout {
+		kind = Timeout
 	}
 	tr := Transition[S, T]{Source: i.state, Destination: S(dst), Trigger: t, Kind: kind}
 
@@ -380,8 +491,62 @@ func (i *Instance[S, T, E]) doTransition(ctx context.Context, src, dst int, t T,
 		st = sub
 	}
 
+	i.armTimeout()
 	i.c.transitions.Add(1)
 	return nil
+}
+
+// armTimeout (re)arms the state timeout for the current leaf. It reads the
+// clock only when the leaf actually declares a timeout, so timeout-free
+// machines never touch the clock.
+func (i *Instance[S, T, E]) armTimeout() {
+	d := i.cfg.timeoutDur[i.state]
+	if d <= 0 {
+		i.hasDeadline = false
+		return
+	}
+	i.deadline = i.cfg.clock.Now().Add(d)
+	i.timeoutTrig = i.cfg.timeoutTrig[i.state]
+	i.hasDeadline = true
+}
+
+// NextDeadline reports the deadline of the current state's timeout, if any. The
+// owner integrates it into its own timer/select loop; the machine owns no
+// timer of its own.
+func (i *Instance[S, T, E]) NextDeadline() (time.Time, bool) {
+	if i.hasDeadline {
+		return i.deadline, true
+	}
+	return time.Time{}, false
+}
+
+// Tick fires the current state's timeout trigger (with a zero event and Kind
+// Timeout) if its deadline is at or before now, then drains the
+// run-to-completion queue. It is a no-op when no timeout is armed or the
+// deadline has not elapsed. Like Fire, it must be called from the owning
+// goroutine.
+func (i *Instance[S, T, E]) Tick(ctx context.Context, now time.Time) error {
+	if !i.hasDeadline || now.Before(i.deadline) {
+		return nil
+	}
+	t := i.timeoutTrig
+	// Consume the deadline; a resulting transition re-arms via armTimeout, and
+	// an unhandled timeout does not refire on the next Tick.
+	i.hasDeadline = false
+	i.c.timeouts.Add(1)
+
+	i.firing = true
+	var zero E
+	prev := i.state
+	err := i.fireOne(ctx, t, zero, true)
+	if i.state != prev {
+		i.reofferDeferred()
+	}
+	if e := i.drain(ctx); e != nil && err == nil {
+		err = e
+	}
+	i.firing = false
+	return err
 }
 
 func (i *Instance[S, T, E]) guardsPass(ctx context.Context, guards []Guard[E], ev E, rejected *[]string) bool {

@@ -2,17 +2,26 @@
 
 package fsm
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // DefaultQueueCapacity is the run-to-completion queue depth used when
 // [WithQueueCapacity] is not supplied.
 const DefaultQueueCapacity = 8
 
+// DefaultDeferCapacity is the deferral ring depth used when [WithDeferCapacity]
+// is not supplied.
+const DefaultDeferCapacity = 8
+
 // settings holds non-generic build options so Option values need not be
 // parameterized.
 type settings struct {
 	queueCap   int
+	deferCap   int
 	guardNames bool
+	clock      Clock
 }
 
 // Option configures a [Builder] (and the [Config] it produces).
@@ -22,9 +31,17 @@ type Option func(*settings)
 // Values < 1 are clamped to 1.
 func WithQueueCapacity(n int) Option { return func(s *settings) { s.queueCap = n } }
 
+// WithDeferCapacity sets the deferral ring depth (per instance) for machines
+// that use Defer. Values < 1 are clamped to 1.
+func WithDeferCapacity(n int) Option { return func(s *settings) { s.deferCap = n } }
+
 // WithGuardNames enables collection of failing guard names into
 // [GuardsRejectedError]. Off by default to avoid the allocation.
 func WithGuardNames() Option { return func(s *settings) { s.guardNames = true } }
+
+// WithClock sets the time source for state timeouts. The default is real
+// wall-clock time; tests inject a fake clock for deterministic timeout edges.
+func WithClock(c Clock) Option { return func(s *settings) { s.clock = c } }
 
 // stateBuild accumulates one state's configuration during building.
 type stateBuild[S ~uint8, T ~uint8, E any] struct {
@@ -37,6 +54,11 @@ type stateBuild[S ~uint8, T ~uint8, E any] struct {
 	parent     S
 	hasInitial bool
 	initial    S
+
+	deferTrigs  []T
+	hasTimeout  bool
+	timeoutDur  time.Duration
+	timeoutTrig T
 }
 
 // Builder configures a machine fluently, then lowers it with [Builder.Build].
@@ -48,12 +70,18 @@ type Builder[S ~uint8, T ~uint8, E any] struct {
 
 // New returns a Builder for a machine whose initial state is initial.
 func New[S ~uint8, T ~uint8, E any](initial S, opts ...Option) *Builder[S, T, E] {
-	set := settings{queueCap: DefaultQueueCapacity}
+	set := settings{queueCap: DefaultQueueCapacity, deferCap: DefaultDeferCapacity, clock: realClock{}}
 	for _, o := range opts {
 		o(&set)
 	}
 	if set.queueCap < 1 {
 		set.queueCap = 1
+	}
+	if set.deferCap < 1 {
+		set.deferCap = 1
+	}
+	if set.clock == nil {
+		set.clock = realClock{}
 	}
 	return &Builder[S, T, E]{
 		initial: initial,
@@ -129,6 +157,29 @@ func (c *StateCfg[S, T, E]) Ignore(t T, guards ...Guard[E]) *StateCfg[S, T, E] {
 	return c
 }
 
+// Defer marks triggers ts as deferred in this state: while here, they are
+// neither handled nor discarded but stashed and re-offered in FIFO order after
+// the next transition that changes the leaf state. Deferral is inherited by
+// substates. A state that also handles a trigger consumes it (handling wins
+// over deferral).
+func (c *StateCfg[S, T, E]) Defer(ts ...T) *StateCfg[S, T, E] {
+	c.sb.deferTrigs = append(c.sb.deferTrigs, ts...)
+	return c
+}
+
+// Timeout arms a state timeout: entering this state records a deadline d in the
+// future (per the injected clock); when the owner calls Tick at or after the
+// deadline, trigger t is fired with Kind Timeout. A state has at most one
+// timeout; a later call replaces an earlier one. The timeout only fires while
+// the state is the resting leaf, so declaring it on a composite state is a
+// [BuildError].
+func (c *StateCfg[S, T, E]) Timeout(d time.Duration, t T) *StateCfg[S, T, E] {
+	c.sb.hasTimeout = true
+	c.sb.timeoutDur = d
+	c.sb.timeoutTrig = t
+	return c
+}
+
 // OnEntry adds an action run when the state is entered (any trigger).
 func (c *StateCfg[S, T, E]) OnEntry(a Action[S, T, E]) *StateCfg[S, T, E] {
 	c.sb.onEntry = append(c.sb.onEntry, a)
@@ -177,6 +228,14 @@ func (b *Builder[S, T, E]) Build() (*Config[S, T, E], error) {
 					maxState = int(cands[i].dst)
 				}
 			}
+		}
+		for _, t := range sb.deferTrigs {
+			if int(t) > maxTrigger {
+				maxTrigger = int(t)
+			}
+		}
+		if sb.hasTimeout && int(sb.timeoutTrig) > maxTrigger {
+			maxTrigger = int(sb.timeoutTrig)
 		}
 	}
 
@@ -230,6 +289,48 @@ func (b *Builder[S, T, E]) Build() (*Config[S, T, E], error) {
 
 	h := computeHierarchy(numStates, parentOf, initialOf, directlyEntered, &issues)
 
+	// Deferral: lower per-state declared defers, then propagate down the
+	// ancestor chain so a substate inherits its ancestors' deferrals.
+	deferWords := (numTriggers + 63) / 64
+	if deferWords < 1 {
+		deferWords = 1
+	}
+	declared := make([]uint64, numStates*deferWords)
+	hasDefer := false
+	for s, sb := range b.states {
+		for _, t := range sb.deferTrigs {
+			declared[int(s)*deferWords+int(t)/64] |= 1 << (uint(t) % 64)
+			hasDefer = true
+		}
+	}
+	var deferMask []uint64
+	if hasDefer && len(issues) == 0 {
+		deferMask = make([]uint64, numStates*deferWords)
+		for s := 0; s < numStates; s++ {
+			for x := s; x >= 0; x = h.parent[x] {
+				for w := 0; w < deferWords; w++ {
+					deferMask[s*deferWords+w] |= declared[x*deferWords+w]
+				}
+			}
+		}
+	}
+
+	// State timeouts.
+	timeoutDur := make([]time.Duration, numStates)
+	timeoutTrig := make([]T, numStates)
+	for s, sb := range b.states {
+		if !sb.hasTimeout {
+			continue
+		}
+		if h.hasChildren != nil && h.hasChildren[int(s)] {
+			issues = append(issues, fmt.Sprintf(
+				"fsm: timeout on composite state %d never fires (only leaves rest)", uint8(s)))
+			continue
+		}
+		timeoutDur[int(s)] = sb.timeoutDur
+		timeoutTrig[int(s)] = sb.timeoutTrig
+	}
+
 	if len(issues) > 0 {
 		return nil, &BuildError{Issues: issues}
 	}
@@ -247,6 +348,13 @@ func (b *Builder[S, T, E]) Build() (*Config[S, T, E], error) {
 		ancestors:     h.ancestors,
 		wordsPerState: h.wordsPerState,
 		maxDepth:      h.maxDepth,
+		clock:         b.set.clock,
+		deferCap:      b.set.deferCap,
+		hasDefer:      hasDefer,
+		deferMask:     deferMask,
+		deferWords:    deferWords,
+		timeoutDur:    timeoutDur,
+		timeoutTrig:   timeoutTrig,
 	}, nil
 }
 
