@@ -23,10 +23,21 @@
 // owner, not through locking; the library has no mutexes on the fire path. The
 // exported counters are atomic so a second goroutine may scrape them.
 //
-// This slice provides flat (non-hierarchical) machines: external / internal /
+// # Hierarchy
+//
+// States form a tree via [StateCfg.Parent]. A trigger fired in a leaf state is
+// resolved by walking up the ancestor chain: the innermost state with an
+// enabled (guards passing) candidate handles it (behavioral inheritance). An
+// external transition exits from the active leaf up to — but not including —
+// the least common ancestor of the handler and destination, then enters down
+// to the destination, following [StateCfg.Initial] transitions to a resting
+// leaf. [Instance.IsIn] is substate-aware: it reports true for the current leaf
+// and every ancestor.
+//
+// This slice provides flat and hierarchical machines: external / internal /
 // reentry / ignore transitions, guards, entry/exit/trigger-specific-entry
-// actions, and the run-to-completion queue. Hierarchy, deferral, state
-// timeouts, snapshots, and diagram export follow in later slices.
+// actions, initial transitions, and the run-to-completion queue. Deferral,
+// state timeouts, snapshots, and diagram export follow in later slices.
 package fsm
 
 import (
@@ -47,7 +58,8 @@ const (
 	Internal
 	// Reentry re-enters the current state, running exit then entry actions.
 	Reentry
-	// Initial is an initial transition into a substate (later slice).
+	// Initial is an initial transition into a substate, run while descending
+	// into a composite state after its entry actions.
 	Initial
 	// Timeout is a transition driven by a state timeout (later slice).
 	Timeout
@@ -139,15 +151,34 @@ type Config[S ~uint8, T ~uint8, E any] struct {
 	states      []stateInfo[S, T, E]
 	queueCap    int
 	guardNames  bool
+
+	// Hierarchy, computed once by Build. parent[s] is the parent state index or
+	// -1 for a root; initialSub[s] is the initial substate index or -1 for a
+	// simple (leaf) state. depth[s] is the number of hops to a root. ancestors
+	// is a per-state bitset (wordsPerState uint64 words each) with a bit set for
+	// the state itself and every ancestor, backing substate-aware IsIn.
+	parent        []int
+	depth         []int
+	initialSub    []int
+	ancestors     []uint64
+	wordsPerState int
+	maxDepth      int
 }
 
 // Instance returns a fresh machine instance positioned at the configured
-// initial state.
+// initial state, descending initial transitions to a resting leaf. It runs no
+// entry actions: an instance is positioned, not activated. The owner drives all
+// behavior through Fire.
 func (c *Config[S, T, E]) Instance() *Instance[S, T, E] {
+	st := int(c.initial)
+	for c.initialSub[st] >= 0 {
+		st = c.initialSub[st]
+	}
 	return &Instance[S, T, E]{
-		cfg:   c,
-		state: c.initial,
-		queue: make([]queued[T, E], c.queueCap),
+		cfg:     c,
+		state:   S(st),
+		queue:   make([]queued[T, E], c.queueCap),
+		pathBuf: make([]S, c.maxDepth+1),
 	}
 }
 
@@ -184,6 +215,10 @@ type Instance[S ~uint8, T ~uint8, E any] struct {
 	qhead  int
 	qlen   int
 
+	// pathBuf is a scratch buffer for the enter-down walk, sized to the tree
+	// height at Instance creation so the fire path allocates nothing.
+	pathBuf []S
+
 	c counters
 }
 
@@ -199,14 +234,6 @@ func (i *Instance[S, T, E]) Stats() Counters {
 		Unhandled:     i.c.unhandled.Load(),
 		QueueOverflow: i.c.queueOverflow.Load(),
 	}
-}
-
-func (c *Config[S, T, E]) at(s S, t T) *cell[S, T, E] {
-	si, ti := int(s), int(t)
-	if si >= c.numStates || ti >= c.numTriggers {
-		return nil
-	}
-	return &c.table[si*c.numTriggers+ti]
 }
 
 // Fire delivers trigger t with event ev. If called from within an action
@@ -246,55 +273,115 @@ func (i *Instance[S, T, E]) Fire(ctx context.Context, t T, ev E) error {
 
 func (i *Instance[S, T, E]) fireOne(ctx context.Context, t T, ev E) error {
 	i.c.fires.Add(1)
-	cl := i.cfg.at(i.state, t)
-	if cl == nil || len(cl.candidates) == 0 {
+	if int(t) >= i.cfg.numTriggers {
 		i.c.unhandled.Add(1)
 		return &UnhandledError[S, T]{State: i.state, Trigger: t}
 	}
 
+	// Resolve the handler by walking up the ancestor chain. The innermost state
+	// with an enabled (guards-passing) candidate wins; a guard-rejected inner
+	// candidate does not shadow an enabled ancestor.
 	var rejected []string
-	for idx := range cl.candidates {
-		cand := &cl.candidates[idx]
-		if !i.guardsPass(ctx, cand.guards, ev, &rejected) {
-			continue
+	sawCandidate := false
+	for h := int(i.state); ; {
+		cl := i.cfg.cell(h, int(t))
+		if len(cl.candidates) > 0 {
+			sawCandidate = true
+			for idx := range cl.candidates {
+				cand := &cl.candidates[idx]
+				if !i.guardsPass(ctx, cand.guards, ev, &rejected) {
+					continue
+				}
+				switch cand.kind {
+				case ckIgnore:
+					return nil
+				case ckInternal:
+					tr := Transition[S, T]{Source: i.state, Destination: i.state, Trigger: t, Kind: Internal}
+					return i.runAction(ctx, cand.action, tr, ev)
+				case ckReentry:
+					return i.doTransition(ctx, h, h, t, ev, true, cand.action)
+				default: // ckExternal
+					return i.doTransition(ctx, h, int(cand.dst), t, ev, false, cand.action)
+				}
+			}
 		}
-		switch cand.kind {
-		case ckIgnore:
-			return nil
-		case ckInternal:
-			tr := Transition[S, T]{Source: i.state, Destination: i.state, Trigger: t, Kind: Internal}
-			return i.runAction(ctx, cand.action, tr, ev)
-		case ckReentry:
-			tr := Transition[S, T]{Source: i.state, Destination: i.state, Trigger: t, Kind: Reentry}
-			if err := i.runExit(ctx, tr, ev); err != nil {
-				return err
-			}
-			if err := i.runAction(ctx, cand.action, tr, ev); err != nil {
-				return err
-			}
-			if err := i.runEntry(ctx, i.state, tr, ev); err != nil {
-				return err
-			}
-			i.c.transitions.Add(1)
-			return nil
-		default: // ckExternal
-			tr := Transition[S, T]{Source: i.state, Destination: cand.dst, Trigger: t, Kind: External}
-			if err := i.runExit(ctx, tr, ev); err != nil {
-				return err
-			}
-			if err := i.runAction(ctx, cand.action, tr, ev); err != nil {
-				return err
-			}
-			i.state = cand.dst
-			if err := i.runEntry(ctx, cand.dst, tr, ev); err != nil {
-				return err
-			}
-			i.c.transitions.Add(1)
-			return nil
+		p := i.cfg.parent[h]
+		if p < 0 {
+			break
 		}
+		h = p
+	}
+	if !sawCandidate {
+		i.c.unhandled.Add(1)
+		return &UnhandledError[S, T]{State: i.state, Trigger: t}
 	}
 	i.c.rejected.Add(1)
 	return &GuardsRejectedError[S, T]{State: i.state, Trigger: t, Guards: rejected}
+}
+
+// doTransition performs an external or reentry transition whose handler is
+// state src and whose target is dst. It exits from the active leaf up to (but
+// not including) the boundary, runs the transition action, enters down to dst,
+// then follows initial transitions to a resting leaf. For an external
+// transition the boundary is the least common ancestor of src and dst; for a
+// reentry it is the parent of src, so src itself is exited and re-entered.
+func (i *Instance[S, T, E]) doTransition(ctx context.Context, src, dst int, t T, ev E, reentry bool, action Action[S, T, E]) error {
+	kind := External
+	boundary := i.cfg.lcaOf(src, dst)
+	if reentry {
+		kind = Reentry
+		boundary = i.cfg.parent[src]
+	}
+	tr := Transition[S, T]{Source: i.state, Destination: S(dst), Trigger: t, Kind: kind}
+
+	// Exit from the active leaf upward, bottom-up, stopping below the boundary.
+	for s := int(i.state); s != boundary; {
+		if err := i.runExitState(ctx, S(s), tr, ev); err != nil {
+			return err
+		}
+		p := i.cfg.parent[s]
+		if p < 0 {
+			break
+		}
+		s = p
+	}
+
+	if err := i.runAction(ctx, action, tr, ev); err != nil {
+		return err
+	}
+
+	// Collect the entry path (dst up to just below the boundary), then enter
+	// top-down.
+	n := 0
+	for s := dst; s != boundary; {
+		i.pathBuf[n] = S(s)
+		n++
+		p := i.cfg.parent[s]
+		if p < 0 {
+			break
+		}
+		s = p
+	}
+	for k := n - 1; k >= 0; k-- {
+		if err := i.runEntryState(ctx, i.pathBuf[k], tr, ev, true); err != nil {
+			return err
+		}
+		i.state = i.pathBuf[k]
+	}
+
+	// Descend initial transitions into any composite destination.
+	for st := int(i.state); i.cfg.initialSub[st] >= 0; {
+		sub := i.cfg.initialSub[st]
+		itr := Transition[S, T]{Source: S(st), Destination: S(sub), Trigger: t, Kind: Initial}
+		if err := i.runEntryState(ctx, S(sub), itr, ev, false); err != nil {
+			return err
+		}
+		i.state = S(sub)
+		st = sub
+	}
+
+	i.c.transitions.Add(1)
+	return nil
 }
 
 func (i *Instance[S, T, E]) guardsPass(ctx context.Context, guards []Guard[E], ev E, rejected *[]string) bool {
@@ -309,8 +396,8 @@ func (i *Instance[S, T, E]) guardsPass(ctx context.Context, guards []Guard[E], e
 	return true
 }
 
-func (i *Instance[S, T, E]) runExit(ctx context.Context, tr Transition[S, T], ev E) error {
-	for _, a := range i.cfg.states[i.state].onExit {
+func (i *Instance[S, T, E]) runExitState(ctx context.Context, st S, tr Transition[S, T], ev E) error {
+	for _, a := range i.cfg.states[st].onExit {
 		if err := i.runAction(ctx, a, tr, ev); err != nil {
 			return err
 		}
@@ -318,14 +405,17 @@ func (i *Instance[S, T, E]) runExit(ctx context.Context, tr Transition[S, T], ev
 	return nil
 }
 
-func (i *Instance[S, T, E]) runEntry(ctx context.Context, dst S, tr Transition[S, T], ev E) error {
-	si := i.cfg.states[dst]
+// runEntryState runs a state's entry actions. If allowFrom is set, the
+// trigger-specific OnEntryFrom action (if any) runs after the unconditional
+// entry actions; initial-transition descents pass allowFrom=false.
+func (i *Instance[S, T, E]) runEntryState(ctx context.Context, st S, tr Transition[S, T], ev E, allowFrom bool) error {
+	si := &i.cfg.states[st]
 	for _, a := range si.onEntry {
 		if err := i.runAction(ctx, a, tr, ev); err != nil {
 			return err
 		}
 	}
-	if si.onEntryFrom != nil {
+	if allowFrom && si.onEntryFrom != nil {
 		if a, ok := si.onEntryFrom[tr.Trigger]; ok {
 			if err := i.runAction(ctx, a, tr, ev); err != nil {
 				return err
@@ -345,19 +435,34 @@ func (i *Instance[S, T, E]) runAction(ctx context.Context, a Action[S, T, E], tr
 	return nil
 }
 
-// CanFire reports whether trigger t would be accepted now: a candidate exists
-// and its guards pass. It has no side effects.
+// State returns the current leaf state. IsIn reports true for the current leaf
+// and every ancestor.
+//
+// IsIn reports whether the machine is currently in state s, taking hierarchy
+// into account: it is true when s is the current leaf or any of its ancestors.
+func (i *Instance[S, T, E]) IsIn(s S) bool {
+	return i.cfg.isAncestorOrSelf(int(i.state), int(s))
+}
+
+// CanFire reports whether trigger t would be accepted now: an enabled candidate
+// exists in the current state or an ancestor. It has no side effects.
 func (i *Instance[S, T, E]) CanFire(ctx context.Context, t T, ev E) bool {
-	cl := i.cfg.at(i.state, t)
-	if cl == nil {
+	if int(t) >= i.cfg.numTriggers {
 		return false
 	}
-	for idx := range cl.candidates {
-		if i.guardsPassNoRecord(ctx, cl.candidates[idx].guards, ev) {
-			return true
+	for h := int(i.state); ; {
+		cl := i.cfg.cell(h, int(t))
+		for idx := range cl.candidates {
+			if i.guardsPassNoRecord(ctx, cl.candidates[idx].guards, ev) {
+				return true
+			}
 		}
+		p := i.cfg.parent[h]
+		if p < 0 {
+			return false
+		}
+		h = p
 	}
-	return false
 }
 
 func (i *Instance[S, T, E]) guardsPassNoRecord(ctx context.Context, guards []Guard[E], ev E) bool {

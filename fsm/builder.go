@@ -32,6 +32,11 @@ type stateBuild[S ~uint8, T ~uint8, E any] struct {
 	onExit      []Action[S, T, E]
 	onEntryFrom map[T]Action[S, T, E]
 	cells       map[T][]candidate[S, T, E]
+
+	hasParent  bool
+	parent     S
+	hasInitial bool
+	initial    S
 }
 
 // Builder configures a machine fluently, then lowers it with [Builder.Build].
@@ -73,6 +78,25 @@ func (b *Builder[S, T, E]) State(s S) *StateCfg[S, T, E] {
 		b.states[s] = sb
 	}
 	return &StateCfg[S, T, E]{b: b, s: s, sb: sb}
+}
+
+// Parent nests this state under state p, making it a substate. A trigger with
+// no handler in this state is resolved by walking up to p (and its ancestors).
+func (c *StateCfg[S, T, E]) Parent(p S) *StateCfg[S, T, E] {
+	c.sb.hasParent = true
+	c.sb.parent = p
+	c.b.State(p) // ensure the parent is a known state
+	return c
+}
+
+// Initial declares sub as the initial substate entered when this composite
+// state is entered directly. sub must be a direct child (its Parent is this
+// state), enforced at Build time.
+func (c *StateCfg[S, T, E]) Initial(sub S) *StateCfg[S, T, E] {
+	c.sb.hasInitial = true
+	c.sb.initial = sub
+	c.b.State(sub) // ensure the substate is a known state
+	return c
 }
 
 // Permit adds an external transition on trigger t to dst, taken when all guards
@@ -171,25 +195,58 @@ func (b *Builder[S, T, E]) Build() (*Config[S, T, E], error) {
 		}
 	}
 
+	parentOf := make([]int, numStates)
+	initialOf := make([]int, numStates)
+	for i := range parentOf {
+		parentOf[i] = -1
+		initialOf[i] = -1
+	}
+	directlyEntered := make([]bool, numStates)
+	directlyEntered[int(b.initial)] = true
+	for s, sb := range b.states {
+		if sb.hasParent {
+			parentOf[int(s)] = int(sb.parent)
+		}
+		if sb.hasInitial {
+			initialOf[int(s)] = int(sb.initial)
+		}
+	}
+
 	table := make([]cell[S, T, E], numStates*numTriggers)
 	for s, sb := range b.states {
 		for t, cands := range sb.cells {
 			validateCandidates(uint8(s), uint8(t), cands, &issues)
+			for i := range cands {
+				switch cands[i].kind {
+				case ckExternal:
+					directlyEntered[int(cands[i].dst)] = true
+				case ckReentry:
+					directlyEntered[int(s)] = true
+				}
+			}
 			table[int(s)*numTriggers+int(t)].candidates = cands
 		}
 	}
+
+	h := computeHierarchy(numStates, parentOf, initialOf, directlyEntered, &issues)
 
 	if len(issues) > 0 {
 		return nil, &BuildError{Issues: issues}
 	}
 	return &Config[S, T, E]{
-		initial:     b.initial,
-		numStates:   numStates,
-		numTriggers: numTriggers,
-		table:       table,
-		states:      states,
-		queueCap:    b.set.queueCap,
-		guardNames:  b.set.guardNames,
+		initial:       b.initial,
+		numStates:     numStates,
+		numTriggers:   numTriggers,
+		table:         table,
+		states:        states,
+		queueCap:      b.set.queueCap,
+		guardNames:    b.set.guardNames,
+		parent:        h.parent,
+		depth:         h.depth,
+		initialSub:    h.initialSub,
+		ancestors:     h.ancestors,
+		wordsPerState: h.wordsPerState,
+		maxDepth:      h.maxDepth,
 	}, nil
 }
 
