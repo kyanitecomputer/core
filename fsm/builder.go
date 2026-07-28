@@ -334,7 +334,7 @@ func (b *Builder[S, T, E]) Build() (*Config[S, T, E], error) {
 	if len(issues) > 0 {
 		return nil, &BuildError{Issues: issues}
 	}
-	return &Config[S, T, E]{
+	cfg := &Config[S, T, E]{
 		initial:       b.initial,
 		numStates:     numStates,
 		numTriggers:   numTriggers,
@@ -355,7 +355,9 @@ func (b *Builder[S, T, E]) Build() (*Config[S, T, E], error) {
 		deferWords:    deferWords,
 		timeoutDur:    timeoutDur,
 		timeoutTrig:   timeoutTrig,
-	}, nil
+	}
+	cfg.version = cfg.computeVersion()
+	return cfg, nil
 }
 
 // validateCandidates enforces that a (state, trigger) cell has at most one

@@ -164,6 +164,7 @@ type Config[S ~uint8, T ~uint8, E any] struct {
 	states      []stateInfo[S, T, E]
 	queueCap    int
 	guardNames  bool
+	version     uint32
 
 	// Hierarchy, computed once by Build. parent[s] is the parent state index or
 	// -1 for a root; initialSub[s] is the initial substate index or -1 for a

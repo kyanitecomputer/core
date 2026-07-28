@@ -1,0 +1,17 @@
+digraph fsm {
+  rankdir=LR;
+  compound=true;
+  n0 [label="off"];
+  subgraph cluster_1 {
+    label="on";
+    ini1 [shape=point,label=""];
+    ini1 -> n2;
+    n2 [label="idle"];
+    n3 [label="active"];
+  }
+  n0 -> n2 [label="power",lhead=cluster_1];
+  n2 -> n0 [label="shutdown",ltail=cluster_1];
+  n2 -> n2 [label="reset (reentry)",ltail=cluster_1,lhead=cluster_1];
+  n2 -> n3 [label="activate"];
+  n3 -> n2 [label="deactivate"];
+}

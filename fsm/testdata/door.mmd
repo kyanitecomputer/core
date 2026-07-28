@@ -1,0 +1,7 @@
+stateDiagram-v2
+  [*] --> closed
+  closed --> open : open
+  closed --> locked : lock [lockable]
+  open --> closed : close
+  locked --> closed : unlock
+  locked --> locked : knock (ignore)

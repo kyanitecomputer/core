@@ -3,9 +3,18 @@
 package fsm
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
+
+// ErrSnapshotVersion is returned by [Instance.Restore] when the snapshot was
+// taken from a machine with a different compiled topology.
+var ErrSnapshotVersion = errors.New("fsm: snapshot version mismatch")
+
+// ErrUnknownState is returned by [Instance.Restore] when the snapshot's state
+// is not a valid state of the machine.
+var ErrUnknownState = errors.New("fsm: unknown state in snapshot")
 
 // UnhandledError reports that no transition is configured for a trigger in the
 // current state. It is an ordinary input-shaped failure, not a panic: an

@@ -1,0 +1,12 @@
+digraph fsm {
+  rankdir=LR;
+  compound=true;
+  n0 [label="closed"];
+  n1 [label="open"];
+  n2 [label="locked"];
+  n0 -> n1 [label="open"];
+  n0 -> n2 [label="lock [lockable]"];
+  n1 -> n0 [label="close"];
+  n2 -> n0 [label="unlock"];
+  n2 -> n2 [label="knock (ignore)",style=dashed];
+}
