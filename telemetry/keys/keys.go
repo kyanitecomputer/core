@@ -51,3 +51,19 @@ const (
 	// ServiceName is the emitting service/runtime name (e.g. "vein", "cairn").
 	ServiceName Key = "service.name"
 )
+
+// State-machine keys (project-local fsm.* namespace) for transition span events
+// and structured logs. All values are low-cardinality by construction: states
+// and triggers are enums with generated names, and kind is a fixed small set.
+const (
+	// FSMName identifies the machine (e.g. "ipmi.session", "port.link").
+	FSMName Key = "fsm.name"
+	// FSMFrom is the source state name of a transition.
+	FSMFrom Key = "fsm.from"
+	// FSMTo is the destination (resting leaf) state name of a transition.
+	FSMTo Key = "fsm.to"
+	// FSMTrigger is the trigger name that drove the transition.
+	FSMTrigger Key = "fsm.trigger"
+	// FSMKind is the transition kind (external, internal, reentry, timeout).
+	FSMKind Key = "fsm.kind"
+)

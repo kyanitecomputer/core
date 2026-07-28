@@ -16,14 +16,18 @@ type Labeler[S ~uint8, T ~uint8] struct {
 	Trigger func(T) string
 }
 
-func (l Labeler[S, T]) state(s S) string {
+// StateName returns the label for state s, falling back to S<n> when no State
+// function is set.
+func (l Labeler[S, T]) StateName(s S) string {
 	if l.State != nil {
 		return l.State(s)
 	}
 	return fmt.Sprintf("S%d", uint8(s))
 }
 
-func (l Labeler[S, T]) trigger(t T) string {
+// TriggerName returns the label for trigger t, falling back to T<n> when no
+// Trigger function is set.
+func (l Labeler[S, T]) TriggerName(t T) string {
 	if l.Trigger != nil {
 		return l.Trigger(t)
 	}
@@ -78,7 +82,7 @@ func (c *Config[S, T, E]) repLeaf(s int) int {
 // brackets (or a bare [guard] marker for unnamed guards), and a kind suffix in
 // parentheses for non-external transitions.
 func (c *Config[S, T, E]) edgeLabel(l Labeler[S, T], t T, guards []Guard[E], extra string) string {
-	s := l.trigger(t)
+	s := l.TriggerName(t)
 	if len(guards) > 0 {
 		var names []string
 		for _, g := range guards {
@@ -142,28 +146,28 @@ func (c *Config[S, T, E]) edges(l Labeler[S, T]) []candidateEdge {
 func (c *Config[S, T, E]) Mermaid(l Labeler[S, T]) string {
 	var b strings.Builder
 	b.WriteString("stateDiagram-v2\n")
-	fmt.Fprintf(&b, "  [*] --> %s\n", l.state(c.initial))
+	fmt.Fprintf(&b, "  [*] --> %s\n", l.StateName(c.initial))
 	for _, s := range c.roots() {
 		if c.composite(s) {
 			c.mermaidState(&b, l, s, "  ")
 		}
 	}
 	for _, e := range c.edges(l) {
-		fmt.Fprintf(&b, "  %s --> %s : %s\n", l.state(S(e.src)), l.state(S(e.dst)), e.label)
+		fmt.Fprintf(&b, "  %s --> %s : %s\n", l.StateName(S(e.src)), l.StateName(S(e.dst)), e.label)
 	}
 	return b.String()
 }
 
 func (c *Config[S, T, E]) mermaidState(b *strings.Builder, l Labeler[S, T], s int, indent string) {
-	fmt.Fprintf(b, "%sstate %s {\n", indent, l.state(S(s)))
+	fmt.Fprintf(b, "%sstate %s {\n", indent, l.StateName(S(s)))
 	if c.initialSub[s] >= 0 {
-		fmt.Fprintf(b, "%s  [*] --> %s\n", indent, l.state(S(c.initialSub[s])))
+		fmt.Fprintf(b, "%s  [*] --> %s\n", indent, l.StateName(S(c.initialSub[s])))
 	}
 	for _, child := range c.children(s) {
 		if c.composite(child) {
 			c.mermaidState(b, l, child, indent+"  ")
 		} else {
-			fmt.Fprintf(b, "%s  %s\n", indent, l.state(S(child)))
+			fmt.Fprintf(b, "%s  %s\n", indent, l.StateName(S(child)))
 		}
 	}
 	fmt.Fprintf(b, "%s}\n", indent)
@@ -204,11 +208,11 @@ func (c *Config[S, T, E]) DOT(l Labeler[S, T]) string {
 
 func (c *Config[S, T, E]) dotNode(b *strings.Builder, l Labeler[S, T], s int, indent string) {
 	if !c.composite(s) {
-		fmt.Fprintf(b, "%sn%d [label=%q];\n", indent, s, l.state(S(s)))
+		fmt.Fprintf(b, "%sn%d [label=%q];\n", indent, s, l.StateName(S(s)))
 		return
 	}
 	fmt.Fprintf(b, "%ssubgraph cluster_%d {\n", indent, s)
-	fmt.Fprintf(b, "%s  label=%q;\n", indent, l.state(S(s)))
+	fmt.Fprintf(b, "%s  label=%q;\n", indent, l.StateName(S(s)))
 	if c.initialSub[s] >= 0 {
 		fmt.Fprintf(b, "%s  ini%d [shape=point,label=\"\"];\n", indent, s)
 		fmt.Fprintf(b, "%s  ini%d -> n%d;\n", indent, s, c.initialSub[s])

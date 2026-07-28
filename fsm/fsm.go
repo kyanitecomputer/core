@@ -122,6 +122,13 @@ type Guard[E any] struct {
 // is wrapped in an [ActionError].
 type Action[S ~uint8, T ~uint8, E any] func(ctx context.Context, tr Transition[S, T], ev E) error
 
+// Observer is a side-effect-only callback invoked after every completed
+// transition (external, reentry, internal, and timeout — not ignore). Its
+// Destination is the resting leaf. It is the seam the optional otel and slog
+// bridges attach to; core itself creates no spans and imports no telemetry. An
+// observer must not fire triggers or return errors: a transition is a fact.
+type Observer[S ~uint8, T ~uint8, E any] func(ctx context.Context, tr Transition[S, T], ev E)
+
 // candidateKind is the internal transition classification stored per cell.
 type candidateKind uint8
 
@@ -165,6 +172,7 @@ type Config[S ~uint8, T ~uint8, E any] struct {
 	queueCap    int
 	guardNames  bool
 	version     uint32
+	observer    Observer[S, T, E]
 
 	// Hierarchy, computed once by Build. parent[s] is the parent state index or
 	// -1 for a root; initialSub[s] is the initial substate index or -1 for a
@@ -392,7 +400,11 @@ func (i *Instance[S, T, E]) fireOne(ctx context.Context, t T, ev E, timeout bool
 						kind = Timeout
 					}
 					tr := Transition[S, T]{Source: i.state, Destination: i.state, Trigger: t, Kind: kind}
-					return i.runAction(ctx, cand.action, tr, ev)
+					if err := i.runAction(ctx, cand.action, tr, ev); err != nil {
+						return err
+					}
+					i.observe(ctx, tr, ev)
+					return nil
 				case ckReentry:
 					return i.doTransition(ctx, h, h, t, ev, true, timeout, cand.action)
 				default: // ckExternal
@@ -494,7 +506,19 @@ func (i *Instance[S, T, E]) doTransition(ctx context.Context, src, dst int, t T,
 
 	i.armTimeout()
 	i.c.transitions.Add(1)
+	// Report the resting leaf as the destination, which is the meaningful "to"
+	// for observers even when the declared target was a composite.
+	obs := tr
+	obs.Destination = i.state
+	i.observe(ctx, obs, ev)
 	return nil
+}
+
+// observe invokes the configured transition observer, if any.
+func (i *Instance[S, T, E]) observe(ctx context.Context, tr Transition[S, T], ev E) {
+	if i.cfg.observer != nil {
+		i.cfg.observer(ctx, tr, ev)
+	}
 }
 
 // armTimeout (re)arms the state timeout for the current leaf. It reads the

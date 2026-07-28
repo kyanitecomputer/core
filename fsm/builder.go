@@ -63,9 +63,19 @@ type stateBuild[S ~uint8, T ~uint8, E any] struct {
 
 // Builder configures a machine fluently, then lowers it with [Builder.Build].
 type Builder[S ~uint8, T ~uint8, E any] struct {
-	initial S
-	set     settings
-	states  map[S]*stateBuild[S, T, E]
+	initial  S
+	set      settings
+	states   map[S]*stateBuild[S, T, E]
+	observer Observer[S, T, E]
+}
+
+// Observe registers a transition observer invoked after every completed
+// transition. It is the attachment point for the optional otelbridge and
+// slogbridge; core stays telemetry-free. At most one observer is used; a later
+// call replaces an earlier one.
+func (b *Builder[S, T, E]) Observe(o Observer[S, T, E]) *Builder[S, T, E] {
+	b.observer = o
+	return b
 }
 
 // New returns a Builder for a machine whose initial state is initial.
@@ -342,6 +352,7 @@ func (b *Builder[S, T, E]) Build() (*Config[S, T, E], error) {
 		states:        states,
 		queueCap:      b.set.queueCap,
 		guardNames:    b.set.guardNames,
+		observer:      b.observer,
 		parent:        h.parent,
 		depth:         h.depth,
 		initialSub:    h.initialSub,
