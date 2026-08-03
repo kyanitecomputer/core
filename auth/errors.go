@@ -3,8 +3,21 @@
 package auth
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+)
+
+// Registry errors.
+var (
+	// ErrEmptyKey is returned when registering an empty public key.
+	ErrEmptyKey = errors.New("auth: empty public key")
+	// ErrKeyRegistered is returned when registering a key that is already
+	// registered; rotate by revoking the old key first.
+	ErrKeyRegistered = errors.New("auth: public key already registered")
+	// ErrKeyRevoked is returned when registering a key that was revoked; a
+	// revoked per-boot key value must never be reused.
+	ErrKeyRevoked = errors.New("auth: public key was revoked")
 )
 
 // UnknownCapabilityError reports that a principal holds a capability the policy
