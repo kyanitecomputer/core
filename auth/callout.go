@@ -13,6 +13,10 @@ import (
 // missing.
 var ErrCalloutIncomplete = errors.New("auth: callout requires registry, policy, and issuer")
 
+// CalloutSubject is the system subject on which the embedded server issues
+// authorization requests for the callout to answer.
+const CalloutSubject = "$SYS.REQ.USER.AUTH"
+
 // CalloutConfig configures a [Callout]. Registry, Policy, and Issuer are
 // required.
 type CalloutConfig struct {
