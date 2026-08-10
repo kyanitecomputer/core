@@ -510,3 +510,71 @@ local enforcement regime.
 6. Whether `dike`'s clock-gating FSM shares the injectable clock interface with `supervise`
    or duplicates it — same question as `fsm`, presumably same answer (duplicate, avoid module
    coupling).
+
+---
+
+## 19. Implementation status (living)
+
+Naming: the codename `dike` was never adopted; the package is `core/auth`. `dike`/`bulwark`
+are held in reserve should the plane grow enough to warrant a codename. The implementation is
+spread across `core/auth` (decision plane), `core/natscore` (server enablement),
+`core/bus` (client/IPC layer), and `core/mgmt` (node bootstrap), not a single `dike/` tree.
+
+### Done
+
+- **Policy compiler** (§10): `auth.PolicyBuilder`→`Policy`, capability→permission flat table,
+  `{domain}/{device}/{principal}/{inbox}` substitution, auto private-inbox grant, systematic
+  `$SYS.>` deny, de-dup. Stdlib-only (neutral `Permissions`; no JWT coupling).
+- **LOCAL registry** (§7): `auth.LocalRegistry`, per-boot public-key → principal, revoke =
+  remove + tombstone (no reuse). Lock-free, single-owner.
+- **Issuer/minting** (§6.3, §11): `auth.Issuer` mints user JWTs + authorization responses,
+  backed by the `nkeys.KeyPair` interface (TEE-oracle-ready); `GenerateUserKey`/`GenerateIssuerKey`.
+- **LOCAL callout decision** (§6): `auth.Callout.Handle` — decode request, optional trusted-server
+  pin, resolve LOCAL principal, compile, mint or signed-deny. Deny-by-default.
+- **Live server enablement** (§5): `natscore.EnableAuthCallout` — five-account layout, system
+  account, `auth_callout` block, `auth_users` bypass; verified with `DontListen` (pure-IPC).
+- **Runtime plane + bootstrap**: `auth.Plane` (service bypass conn + `Attach` + `ConnectLocal`)
+  and `core/mgmt.Start` (server + Scree JS + callout wired), adopted by vein and cairn as the
+  baseline IPC substrate; end-to-end tests prove LOCAL authorize + deliver + deny.
+
+### Remaining (roughly in priority order)
+
+1. **XKey encryption** (§3, §5): mandatory in the design, currently deferred. Add the service
+   XKey (x25519), decrypt inbound requests / encrypt responses, set `AuthCallout.XKey`. Handler
+   must open the encrypted request and seal the response to the server's one-time key.
+2. **LOCAL signature verification**: `Callout.Handle` currently resolves a LOCAL actor by
+   `connect_opts.nkey` presence only (in-process transport is the trust anchor, §2). Verify the
+   signed nonce for defense-in-depth before the same path is reused for any non-in-process actor.
+3. **Restart hygiene on live restart** (§7): today LOCAL actors are registered once at boot and
+   reconnect with a stable per-boot key (registry stays lock-free). Minting a *fresh* key on a
+   supervise restart + tombstoning + kicking the old connection requires routing registration
+   through the callout's own goroutine (a mailbox), so registry writes stay single-owner.
+4. **Revocation / kick loop** (§12): `$SYS` kick on policy/registry change, cid↔principal table
+   from decisions, CONNZ reconcile after a callout restart, session `jti` tombstone ring.
+5. **OPER plane** (§8): session-token format decision (§18.1 — leaning hand-rolled Ed25519),
+   token validation branch in the decision function, ≤15 min TTL + silent re-mint, recovery
+   credential (Argon2id, lockout). Requires the network listeners below.
+6. **Network listeners**: `mgmt` runs `DontListen` (in-process only). Add the websocket ingress
+   (Facet) and later the leafnode listener; wire the network stack's `SocketFunc` (vein has one;
+   cairn needs network bring-up first). Resolve §18.3 (`DontListen`/per-listener granularity).
+7. **Clock-state gating FSM** (§13): BOOT→SYNCED→HOLDOVER→DEGRADED as a `core/fsm` machine
+   gating token/cert validation; roughtime integration. Duplicate the clock interface (§18.6).
+8. **Audit stream + observability** (§14): `dike.decide` span per decision via an otel bridge,
+   plain atomic counters (decisions{outcome}, kicks, rate-limit hits, tombstone size), and the
+   JetStream audit stream over Scree (use `bus.Streams.EnsureStream`/`Publish`; the helper is
+   ready). Rate-limited security alerts.
+9. **Rate limiting** (§6.2): per-remote-host token bucket, failure lockout, constant-time compare
+   (exempt LOCAL nkeys).
+10. **MESH plane** (§9): DICE-rooted mTLS on leafnode connections, attestation-gated cert
+    issuance, mesh CA (§18.2), per-peer pinned import/export generation, hub topology.
+11. **TEE sealing** (§11): back `Issuer`'s `nkeys.KeyPair` with the GoTEE sign oracle so the
+    issuer seed never enters the normal world; per-platform sealed-seed fallback.
+12. **Supervised auth subtree** (§6.1): today the callout is attached synchronously at boot with
+    a keep-alive `mgmt` service. Make it a proper `Permanent` child in an `auth` OneForOne subtree
+    that re-dials + re-attaches on restart, with readiness gating before LOCAL actors connect.
+
+### Deviations to revisit
+
+- Package layout is by concern across core packages, not the single `dike/` tree sketched in §6.2.
+- `mgmt` starts the embedded server on the device boot path but has only been validated on the
+  host; on-device embedded-NATS validation is pending hardware integration (bind to §18.3).
