@@ -50,6 +50,18 @@ func RegisterRAMStore(size int64) (blkdev.BlockDevice, error) {
 	if err := scree.Format(dev, scree.FormatOptions{JournalBlocks: dev.BlockCount() - 4}); err != nil {
 		return nil, fmt.Errorf("format Scree: %w", err)
 	}
+	return RegisterStore(dev)
+}
+
+// RegisterStore registers an already-formatted Scree block device (e.g. a
+// flash-backed volume built by the device runtime) as the JetStream store. It
+// is the persistent-storage counterpart to RegisterRAMStore: the caller owns
+// the device's construction and formatting; natscore owns the single JetStream
+// store-type registration. Returns the device unchanged for convenience.
+func RegisterStore(dev blkdev.BlockDevice) (blkdev.BlockDevice, error) {
+	if dev == nil {
+		return nil, fmt.Errorf("natscore: store device is nil")
+	}
 
 	screeProvider.Lock()
 	screeProvider.dev = dev
