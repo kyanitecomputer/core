@@ -116,6 +116,51 @@ func TestReservedNamesNotOverridable(t *testing.T) {
 	}
 }
 
+func powerCmd() Command {
+	return Command{
+		Name: "power",
+		Help: "power control",
+		Run:  func(args []string) (string, error) { return strings.Join(args, " "), nil },
+		Complete: func(_ []string, _ string) []string {
+			return []string{"on", "off", "status"}
+		},
+	}
+}
+
+func TestTabCompletesSingleCommand(t *testing.T) {
+	// "ec" + Tab should complete to "echo " so "echo hi" runs.
+	out := runInput(Config{Commands: []Command{echoCmd()}}, "ec\thi\n")
+	if !strings.Contains(out, "hi") || strings.Contains(out, "unknown command") {
+		t.Fatalf("command completion failed, output %q", out)
+	}
+}
+
+func TestTabExtendsToCommonPrefix(t *testing.T) {
+	// "pow" matches both "power" and "poweroff"; Tab must extend to the shared
+	// "power" prefix (not list), so typing "off" then Enter runs "poweroff".
+	off := Command{Name: "poweroff", Run: func([]string) (string, error) { return "OFF", nil }}
+	out := runInput(Config{Commands: []Command{powerCmd(), off}}, "pow\toff\n")
+	if !strings.Contains(out, "OFF") || strings.Contains(out, "unknown command") {
+		t.Fatalf("common-prefix completion failed, output %q", out)
+	}
+}
+
+func TestTabCompletesArgumentValue(t *testing.T) {
+	// "power s" + Tab completes the argument to "status" via Command.Complete.
+	out := runInput(Config{Commands: []Command{powerCmd()}}, "power s\t\n")
+	if !strings.Contains(out, "status") {
+		t.Fatalf("argument completion failed, output %q", out)
+	}
+}
+
+func TestTabListsAmbiguousArguments(t *testing.T) {
+	// "power o" + Tab is ambiguous ("on"/"off") and must list both.
+	out := runInput(Config{Commands: []Command{powerCmd()}}, "power o\t")
+	if !strings.Contains(out, "on") || !strings.Contains(out, "off") {
+		t.Fatalf("ambiguous argument listing failed, output %q", out)
+	}
+}
+
 func TestPromptAndBanner(t *testing.T) {
 	out := runInput(Config{Prompt: "cairn# ", Banner: "WELCOME"}, "")
 	if !strings.Contains(out, "WELCOME") {

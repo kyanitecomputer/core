@@ -20,9 +20,13 @@
 // # Features
 //
 //   - Line editing: mid-line insert/delete, left/right arrows, Home/End
-//     (Ctrl-A/Ctrl-E), Backspace, Delete, Ctrl-U (kill line), Ctrl-C (interrupt)
+//     (Ctrl-A/Ctrl-E), Backspace, Delete, Ctrl-U (kill line), Ctrl-W (delete
+//     previous word), Ctrl-L (clear screen), Ctrl-C (interrupt)
 //   - History: last 16 commands (up/down arrows via VT100 sequences)
-//   - Tab completion on command names (built-ins and registered commands)
+//   - Tab completion of the word at the cursor: command names for the first
+//     word, and per-command argument values via [Command.Complete]. Ambiguous
+//     completions extend to the longest common prefix, then list on a second
+//     Tab (readline-style).
 //   - Built-in commands: help / ?, reboot
 //
 // The package is stdlib-only and host-testable: Run operates purely on
@@ -61,6 +65,13 @@ type Command struct {
 	Help string
 	// Run executes the command.
 	Run func(args []string) (string, error)
+	// Complete, if non-nil, supplies argument completion candidates for Tab
+	// completion. It is called with the already-complete argument words that
+	// precede the word being completed (prev) and the partial word itself
+	// (word, possibly empty). It returns the full candidate words; the engine
+	// filters them by prefix, so a handler may simply return all valid values
+	// for the position. Optional: nil disables argument completion.
+	Complete func(prev []string, word string) []string
 }
 
 // Config configures a [Shell].
@@ -229,6 +240,24 @@ func (s *Shell) runLoop(r io.Reader) {
 			pos = 0
 			s.refresh(line, pos)
 
+		case 0x17: // Ctrl-W — delete the word before the cursor
+			if pos > 0 {
+				i := pos
+				for i > 0 && line[i-1] == ' ' { // skip trailing spaces
+					i--
+				}
+				for i > 0 && line[i-1] != ' ' { // then the word itself
+					i--
+				}
+				line = append(line[:i], line[pos:]...)
+				pos = i
+				s.refresh(line, pos)
+			}
+
+		case 0x0c: // Ctrl-L — clear screen, redraw prompt + current line
+			s.write("\x1b[2J\x1b[H")
+			s.refresh(line, pos)
+
 		case 0x01: // Ctrl-A — move to start of line
 			pos = 0
 			s.refresh(line, pos)
@@ -375,27 +404,90 @@ func (s *Shell) replaceLine(old []byte, newLine string) []byte {
 
 // --- tab completion ---------------------------------------------------------
 
+// tabComplete completes the word at the end of line. The first word completes
+// against command names; later words complete against the invoked command's
+// [Command.Complete] candidates. A single match is inserted with a trailing
+// space; multiple matches first extend to their longest common prefix, and only
+// list (bash-style) when no further prefix can be added. It returns the new
+// line (cursor is repositioned to the end by the caller).
 func (s *Shell) tabComplete(line []byte) []byte {
-	input := string(line)
-	var matches []string
-	for _, c := range s.names {
-		if strings.HasPrefix(c, input) {
-			matches = append(matches, c)
+	text := string(line)
+	trailingSpace := len(text) > 0 && text[len(text)-1] == ' '
+	fields := strings.Fields(text)
+
+	// Determine the partial word under completion and the candidate set.
+	var word string
+	var candidates []string
+	switch {
+	case len(fields) == 0 || (len(fields) == 1 && !trailingSpace):
+		// Completing the command name (first word).
+		if len(fields) == 1 {
+			word = fields[0]
+		}
+		candidates = s.names
+	default:
+		// Completing an argument to fields[0].
+		var prev []string
+		if trailingSpace {
+			prev = fields[1:]
+		} else {
+			word = fields[len(fields)-1]
+			prev = fields[1 : len(fields)-1]
+		}
+		if c, ok := s.cmds[fields[0]]; ok && c.Complete != nil {
+			candidates = c.Complete(prev, word)
 		}
 	}
+
+	// Filter candidates by the partial word.
+	var matches []string
+	for _, cand := range candidates {
+		if strings.HasPrefix(cand, word) {
+			matches = append(matches, cand)
+		}
+	}
+
 	switch len(matches) {
 	case 0:
 		s.write("\a") // bell
+		return line
 	case 1:
-		completed := []byte(matches[0] + " ")
-		s.refresh(completed, len(completed))
-		return completed
+		return s.applyCompletion(text, word, matches[0]+" ")
 	default:
+		if lcp := longestCommonPrefix(matches); len(lcp) > len(word) {
+			return s.applyCompletion(text, word, lcp) // extend, no list yet
+		}
+		sort.Strings(matches)
 		s.writeln("")
 		s.writeln(strings.Join(matches, "  "))
 		s.refresh(line, len(line))
+		return line
 	}
-	return line
+}
+
+// applyCompletion replaces the trailing partial word of text with completion
+// and redraws the line, returning the new line.
+func (s *Shell) applyCompletion(text, word, completion string) []byte {
+	nl := []byte(text[:len(text)-len(word)] + completion)
+	s.refresh(nl, len(nl))
+	return nl
+}
+
+// longestCommonPrefix returns the longest string that prefixes every element.
+func longestCommonPrefix(ss []string) string {
+	if len(ss) == 0 {
+		return ""
+	}
+	p := ss[0]
+	for _, s := range ss[1:] {
+		for !strings.HasPrefix(s, p) {
+			p = p[:len(p)-1]
+			if p == "" {
+				return ""
+			}
+		}
+	}
+	return p
 }
 
 // --- I/O helpers ------------------------------------------------------------
