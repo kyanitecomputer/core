@@ -99,7 +99,7 @@ See `../vein/notes-interrupts.md` for full context. Summary of open items:
   src.kyanite.computer/core/{bus,auth,mgmt,natscore,telemetry}`.
 - Tamago ELF builds: `cd ../cairn && make build` (arm64),
   `cd ../vein && make build` (riscv64).
-- `<tamago-go>` = `/home/mdr164/private/tamago/tamago-go/bin/go` (go1.27rc1
-  tamago port). Per-arch build env:
+- `<tamago-go>` = the path to your tamago-go binary (go1.27 tamago port).
+  Per-arch build env:
   `GOOS=tamago GOARCH={arm64|riscv64} GOOSPKG=github.com/usbarmory/tamago
   GOTOOLCHAIN=local`.
