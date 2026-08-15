@@ -16,12 +16,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"time"
 
 	"src.kyanite.computer/schema/gen/go/schema/v1/schemav1connect"
 )
+
+// connectBase is the same-origin base path the facet SPA calls ConnectRPC on
+// (facet-backend-contract §3.1: /api/connect/schema.v1.<Service>/<Method>).
+const connectBase = "/api/connect"
 
 // Mux builds the management HTTP handler. It mounts the provided ConnectRPC
 // service handlers; the embedded SPA and additional services are added as the
@@ -30,6 +35,23 @@ func Mux(auth schemav1connect.AuthServiceHandler) *http.ServeMux {
 	mux := http.NewServeMux()
 	authPath, authHandler := schemav1connect.NewAuthServiceHandler(auth)
 	mux.Handle(authPath, authHandler)
+	return mux
+}
+
+// Handler builds the full same-origin management surface: the ConnectRPC
+// AuthService under /api/connect and the facet SPA (when assets is non-nil) for
+// everything else. Either argument may be nil (no auth mounted / no SPA, in
+// which case unmatched paths 404). This is the handler cairn and vein serve
+// over TLS on :443.
+func Handler(auth schemav1connect.AuthServiceHandler, assets fs.FS) http.Handler {
+	mux := http.NewServeMux()
+	if auth != nil {
+		p, h := schemav1connect.NewAuthServiceHandler(auth)
+		mux.Handle(connectBase+p, http.StripPrefix(connectBase, h))
+	}
+	if assets != nil {
+		mux.Handle("/", SPAHandler(assets))
+	}
 	return mux
 }
 
