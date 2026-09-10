@@ -1,7 +1,7 @@
 # core
 
 The shared device microkernel for the [Kyanite](https://github.com/kyanitecomputer)
-stack. Part of the Kyanite stack.
+stack.
 
 > **Status:** experimental — expect breaking changes.
 
