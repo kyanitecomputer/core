@@ -1,15 +1,14 @@
-# Kyanite core — roadmap / remaining work
+# Kyanite core — roadmap
 
-Durable handoff of pending work, meant to survive context compaction. Detailed
-per-domain notes live where the work is:
+Pending and in-progress work across the core device microkernel. Detailed
+per-domain design notes live alongside the code:
 
-- **Auth** remaining work: `nats-auth-architecture.md` §19 (authoritative).
-- **Hardware** resume point: `../vein/notes-interrupts.md` ("HARDWARE BRING-UP
-  RESUME POINT").
-- Architecture specs: `supervise-architecture.md`, `fsm-embedded-architecture.md`,
-  `otel-embedded-go-architecture.md`, `nats-auth-architecture.md`.
+- **Auth**: `nats-auth-architecture.md` (§19 lists remaining work in priority order).
+- **Supervision**: `supervise-architecture.md`.
+- **FSM**: `fsm-embedded-architecture.md`.
+- **Telemetry**: `otel-embedded-go-architecture.md`.
 
-## Status snapshot (done)
+## Status snapshot
 
 | Package | State |
 |---|---|
@@ -20,9 +19,8 @@ per-domain notes live where the work is:
 | `auth` | Policy compiler, LOCAL registry, issuer, LOCAL callout, live `Plane`. See §19. |
 | `natscore` | Bounded server + Scree JS store + `EnableAuthCallout`. |
 | `mgmt` | Node bootstrap (server + auth + Scree). Host-validated; on-device pending. |
-| `vein`/`cairn` | `mgmt` scaffolding wired into `main.go`; both ELFs build. **UNCOMMITTED** (standing policy: do not commit vein/cairn until asked). |
 
-All committed core packages test green and build on tamago arm64 + riscv64.
+Core packages test green and build on TamaGo arm64 + riscv64.
 
 ## Remaining work by area
 
@@ -32,8 +30,8 @@ All committed core packages test green and build on tamago arm64 + riscv64.
   triggers (flags, not hard errors — terminal states are legitimate).
 
 ### supervise
-- Slice 3 (deferred, path-2): futures + combinators + `runtime.AddCleanup`
-  tripwire. Build only when a consumer needs it.
+- Slice 3 (deferred): futures + combinators + `runtime.AddCleanup` tripwire.
+  Build only when a consumer needs it.
 
 ### telemetry
 - P4: gated tracing SDK (ParentBased head sampler, non-blocking BSP, exporter)
@@ -60,46 +58,24 @@ All committed core packages test green and build on tamago arm64 + riscv64.
   host-validated so far). Ties to §18.3 (`DontListen`/listener granularity on
   the bare-metal port).
 - Network listeners (websocket for the WebUI; leafnodes for mesh) once the
-  network stack's `SocketFunc` is wired (vein has one; cairn needs network
-  bring-up first).
+  network stack's `SocketFunc` is wired.
 
-### vein / cairn (adoption + housekeeping)
-- **Uncommitted scaffolding**: `target/*/main.go` now bootstraps `mgmt` and runs
-  a demo LOCAL actor over the authorized bus. Commit when asked.
-- **`vein/TODO.md` is partly superseded**: its NATS-core Phases 1–4 are largely
-  realized in `core/{natscore,bus,mgmt}`; Phases 5–7 (config-over-KV, user
-  management, drop-REST) are still open but now land via `core/auth` + `bus`.
-  Reconcile that doc against the core implementation.
-- Migrate the switch protocol state machines (`vein/.../sw/*`: LLDP/RSTP/LACP/
-  IGMP/ERPS/Dot1X) onto `core/fsm`.
+### downstream adoption (runtimes)
+- Migrate the switch protocol state machines (LLDP/RSTP/LACP/IGMP/ERPS/Dot1X)
+  onto `core/fsm`.
 - Adopt telemetry correlation and the `fsm` slog/otel bridges in the agents.
-- Replace the RAM-backed Scree store with flash-backed storage (QSPI NOR on
-  vega; SPI-NOR on cairn) for persistence.
-
-### hardware (resume after compaction)
-See `../vein/notes-interrupts.md` for full context. Summary of open items:
-- **EMAC bring-up**: MAC revision reads `0x00000000` on cold boot (block
-  clock-gated). `eth.EnableSubsystem()` is flashed but UNTESTED. Next: flash,
-  read the `[eth] subsystem pre/post` line, confirm `rev` goes non-zero, plug a
-  cable, check link LED + `net stats rx`. If `rev` non-zero but no link,
-  reverse-engineer per-PHY MDIO power-up/autoneg from `libsdk.so` (ghidra-cli).
-- **Watchdog**: arm + kick the FSL91030M watchdog from a supervised goroutine so
-  a fatal runtime crash auto-resets instead of hanging.
-- **(Later)** rewrite the vega TamaGo fork's RISC-V trap entry/exit for safe
-  async interrupts (`RET`→`MRET`, full frame, dedicated stack), then move RX
-  from polling to interrupt-driven.
+- Replace RAM-backed Scree stores with flash-backed storage (QSPI/SPI-NOR) for
+  persistence.
 
 ## Build / test reference
 
 - Stdlib-only core packages (`-race`, no workspace):
   `GOWORK=off <tamago-go> test -race ./supervise/ ./fsm/` (also `service`,
   `operator`, `cfgstore`, `ramnor`).
-- NATS/otel-dependent core packages (need the workspace): run from a runtime
-  repo, e.g. `cd ../cairn && GOTOOLCHAIN=local <tamago-go> test
+- NATS/otel-dependent core packages need the workspace; run from a runtime repo,
+  e.g. `GOTOOLCHAIN=local <tamago-go> test
   src.kyanite.computer/core/{bus,auth,mgmt,natscore,telemetry}`.
-- Tamago ELF builds: `cd ../cairn && make build` (arm64),
-  `cd ../vein && make build` (riscv64).
-- `<tamago-go>` = the path to your tamago-go binary (go1.27 tamago port).
+- `<tamago-go>` = the path to your tamago-go binary (go1.27 TamaGo port).
   Per-arch build env:
   `GOOS=tamago GOARCH={arm64|riscv64} GOOSPKG=github.com/usbarmory/tamago
   GOTOOLCHAIN=local`.
